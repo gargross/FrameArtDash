@@ -37,7 +37,7 @@ class Field:
     only: str = ""  # shown only for this LAYOUT
 
 
-GROUPS = ("Source", "TV", "Look", "Schedule")
+GROUPS = ("Source", "TV", "Look", "Gallery", "Schedule")
 
 FIELDS: tuple[Field, ...] = (
     # Source
@@ -187,6 +187,56 @@ FIELDS: tuple[Field, ...] = (
     Field("CANVAS_TEXTURE", "Canvas texture", "Look", "false", kind="bool", only="dashboard"),
     Field("OUTPUT_SIZE", "Output size", "Look", "3840x2160", advanced=True),
     Field("JPEG_QUALITY", "JPEG quality", "Look", "90", kind="number", advanced=True),
+    # Gallery
+    Field(
+        "GALLERY",
+        "Museum art",
+        "Gallery",
+        "false",
+        kind="bool",
+        help="Use public-domain paintings from museum open-access collections as the background, "
+        "changing every rotation interval. Overrides the background image.",
+        only="cards",
+    ),
+    Field(
+        "GALLERY_QUERY",
+        "Search terms",
+        "Gallery",
+        "landscape",
+        help="Keywords for the museum search, e.g. 'landscape', 'nocturne', 'winter', 'sea'.",
+        only="cards",
+    ),
+    Field("GALLERY_INTERVAL_MIN", "Rotate every (min)", "Gallery", "60", kind="number", only="cards"),
+    Field(
+        "GALLERY_SOURCES",
+        "Museums",
+        "Gallery",
+        "met,cleveland",
+        help="Comma-separated: met (The Met), cleveland (Cleveland Museum of Art).",
+        advanced=True,
+        only="cards",
+    ),
+    Field(
+        "GALLERY_MIN_WIDTH",
+        "Minimum image width (px)",
+        "Gallery",
+        "3000",
+        kind="number",
+        advanced=True,
+        only="cards",
+    ),
+    Field("GALLERY_CAPTION", "Show title and artist", "Gallery", "true", kind="bool", only="cards"),
+    Field(
+        "CARDS_ON_DEMAND",
+        "Cards only on request",
+        "Gallery",
+        "false",
+        kind="bool",
+        help="Show the picture alone until POST /cards/show (e.g. from a Home Assistant automation); "
+        "cards then disappear after the time below or on POST /cards/hide.",
+        only="cards",
+    ),
+    Field("CARDS_MINUTES", "Show cards for (min)", "Gallery", "15", kind="number", only="cards"),
     # Schedule
     Field("INTERVAL_MIN", "Interval (min)", "Schedule", "10", kind="number"),
     Field(
@@ -338,6 +388,16 @@ class Settings:
     upload_timeout: int = 60
     cleanup_unmanaged: bool = False
 
+    # Gallery / cards on demand
+    gallery: bool = False
+    gallery_query: str = "landscape"
+    gallery_interval_min: int = 60
+    gallery_sources: tuple[str, ...] = ("met", "cleveland")
+    gallery_min_width: int = 3000
+    gallery_caption: bool = True
+    cards_on_demand: bool = False
+    cards_minutes: int = 15
+
     # Schedule / diff
     interval_min: int = 10
     active_hours: tuple[time, time] | None = None
@@ -451,6 +511,17 @@ class Settings:
         if quality > 100:
             raise ConfigError(f"JPEG_QUALITY must be <= 100, got {quality}")
 
+        gallery_sources = tuple(
+            x.strip().lower()
+            for x in (_str(env, "GALLERY_SOURCES") or "met,cleveland").split(",")
+            if x.strip()
+        )
+        unknown = [x for x in gallery_sources if x not in ("met", "cleveland")]
+        if unknown or not gallery_sources:
+            raise ConfigError(
+                f"GALLERY_SOURCES: expected met and/or cleveland, got {', '.join(unknown) or 'nothing'}"
+            )
+
         time_zone = _str(env, "TIME_ZONE")
         if time_zone:
             try:
@@ -493,6 +564,14 @@ class Settings:
             dry_run=_bool(env, "DRY_RUN"),
             upload_timeout=_int(env, "UPLOAD_TIMEOUT", minimum=5),
             cleanup_unmanaged=_bool(env, "CLEANUP_UNMANAGED"),
+            gallery=_bool(env, "GALLERY"),
+            gallery_query=_str(env, "GALLERY_QUERY") or "landscape",
+            gallery_interval_min=_int(env, "GALLERY_INTERVAL_MIN", minimum=5),
+            gallery_sources=gallery_sources,
+            gallery_min_width=_int(env, "GALLERY_MIN_WIDTH", minimum=640),
+            gallery_caption=_bool(env, "GALLERY_CAPTION", True),
+            cards_on_demand=_bool(env, "CARDS_ON_DEMAND"),
+            cards_minutes=_int(env, "CARDS_MINUTES", minimum=1),
             interval_min=_int(env, "INTERVAL_MIN", minimum=1),
             active_hours=parse_active_hours(_str(env, "ACTIVE_HOURS")),
             diff_threshold=_int(env, "DIFF_THRESHOLD", minimum=0),

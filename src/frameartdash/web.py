@@ -30,7 +30,7 @@ BACKGROUNDS = web.AppKey("backgrounds", Backgrounds)
 WEBSTATE = web.AppKey("webstate", dict)
 LOOP = web.AppKey("loop", asyncio.Task)
 
-PUBLIC = {"/login", "/healthz", "/refresh", "/favicon.svg"}
+PUBLIC = {"/login", "/healthz", "/refresh", "/cards/show", "/cards/hide", "/favicon.svg"}
 STATIC_TYPES = {
     ".woff2": "font/woff2",
     ".json": "application/json",
@@ -178,6 +178,9 @@ async def status(request: web.Request) -> web.Response:
             "last_success": service.last_success,
             "next_run": service.next_run.isoformat(timespec="seconds") if service.next_run else None,
             "current_id": state.current_id,
+            "cards_until": state.cards_until,
+            "cards_on_screen": state.cards_on_screen,
+            "gallery": state.gallery,
             "last_upload": state.last_upload,
             "history": service.history.entries(),
             "preview": service.history.preview_info(),
@@ -432,15 +435,49 @@ async def healthz(request: web.Request) -> web.Response:
     return web.json_response(body, status=200 if alive else 503)
 
 
-async def refresh_with_key(request: web.Request) -> web.Response:
-    """For Home Assistant: ``POST /refresh`` with ``Authorization: Bearer <api key>``."""
+def _api_key_ok(request: web.Request) -> bool:
     header = request.headers.get("Authorization", "")
     key = (
         header.removeprefix("Bearer ").strip() or request.headers.get("X-Api-Key") or request.query.get("key")
     )
-    if not request.app[AUTH].check_api_key(key):
+    return request.app[AUTH].check_api_key(key)
+
+
+async def refresh_with_key(request: web.Request) -> web.Response:
+    """For Home Assistant: ``POST /refresh`` with ``Authorization: Bearer <api key>``."""
+    if not _api_key_ok(request):
         return _json_error("invalid API key", 401)
     return await refresh_api(request)
+
+
+def _push_soon(service: Service) -> None:
+    """Run a forced cycle now, or let the scheduler pick the change up if one is running."""
+    if not service.lock.locked():
+        _spawn(service.run_cycle(force=True))
+
+
+async def cards_show(request: web.Request) -> web.Response:
+    """``POST /cards/show[?minutes=N]``: put the cards on the picture for N minutes (default CARDS_MINUTES)."""
+    if not _api_key_ok(request):
+        return _json_error("invalid API key", 401)
+    service = request.app[SERVICE]
+    try:
+        minutes = int(request.query.get("minutes") or 0) or None
+    except ValueError:
+        return _json_error("minutes must be a number")
+    until = service.show_cards(minutes)
+    _push_soon(service)
+    return web.json_response({"status": "accepted", "cards_until": until}, status=202)
+
+
+async def cards_hide(request: web.Request) -> web.Response:
+    """``POST /cards/hide``: back to the picture alone right away."""
+    if not _api_key_ok(request):
+        return _json_error("invalid API key", 401)
+    service = request.app[SERVICE]
+    service.hide_cards()
+    _push_soon(service)
+    return web.json_response({"status": "accepted"}, status=202)
 
 
 # -- app ----------------------------------------------------------------------
@@ -462,6 +499,8 @@ def build_app(service: Service, store: SettingsStore, auth: Auth, run_loop: bool
     r.add_post("/logout", logout)
     r.add_get("/healthz", healthz)
     r.add_post("/refresh", refresh_with_key)
+    r.add_post("/cards/show", cards_show)
+    r.add_post("/cards/hide", cards_hide)
     r.add_get("/api/status", status)
     r.add_get("/api/logs", logs)
     r.add_get("/api/settings", get_settings)

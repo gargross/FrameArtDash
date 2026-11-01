@@ -17,6 +17,10 @@ class State:
     managed_ids: list[str] = field(default_factory=list)
     last_hash: str | None = None
     last_upload: str | None = None
+    cards_until: str | None = None  # ISO time; cards are shown until then (CARDS_ON_DEMAND)
+    cards_on_screen: bool = False  # the picture on the TV has cards (must be replaced when they expire)
+    gallery: dict | None = None  # current artwork: Artwork fields + "file" + "chosen_at"
+    gallery_recent: list[str] = field(default_factory=list)  # source:id of recent picks, newest last
 
     def add(self, content_id: str) -> None:
         if content_id not in self.managed_ids:
@@ -47,6 +51,10 @@ class StateStore:
             managed_ids=list(raw.get("managed_ids", [])),
             last_hash=raw.get("last_hash"),
             last_upload=raw.get("last_upload"),
+            cards_until=raw.get("cards_until"),
+            cards_on_screen=bool(raw.get("cards_on_screen", False)),
+            gallery=raw.get("gallery"),
+            gallery_recent=list(raw.get("gallery_recent", [])),
         )
 
     def save(self, state: State) -> None:
