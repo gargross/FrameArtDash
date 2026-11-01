@@ -6,13 +6,14 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any
 
 from frameartdash import compose, frame as frame_mod, render as render_mod
-from frameartdash.cards.store import LayoutStore
+from frameartdash.cards.store import LayoutStore, normalize_card
 from frameartdash.config import Settings, in_window
+from frameartdash.gallery import Gallery, GalleryError
 from frameartdash.history import History
 from frameartdash.state import State, StateStore
 
@@ -65,6 +66,7 @@ class Service:
         frame_factory: FrameFactory = frame_mod.connect,
         clock: Callable[[], datetime] = datetime.now,
         card_renderer: CardRenderer = render_cards,
+        gallery: Gallery | None = None,
     ) -> None:
         self.settings = settings
         self.renderer = renderer
@@ -73,12 +75,14 @@ class Service:
         self.clock = clock
         self.store = StateStore(settings.state_file)
         self.history = History(settings.data_dir / "history")
+        self.gallery = gallery or Gallery(settings.data_dir / "gallery")
         self.lock = asyncio.Lock()
         self.last_result: CycleResult | None = None
         self.last_success: str | None = None
         self.last_jpeg: bytes | None = None
         self.next_run: datetime | None = None
         self._wake = asyncio.Event()
+        self._last_had_cards = True
         # Render a preview even if the TV is off: on first start and after settings changes.
         self.preview_pending = self.history.preview_info() is None
 
@@ -115,6 +119,16 @@ class Service:
             return CycleResult("skipped", reason=s.not_configured_reason)
 
         state = self.store.load()
+        if s.layout == "cards" and s.gallery:
+            await self._rotate_gallery(state)
+        # Cards that just expired must leave the screen even outside the active hours.
+        if (
+            s.layout == "cards"
+            and s.cards_on_demand
+            and state.cards_on_screen
+            and not self.cards_wanted(state)
+        ):
+            force = True
         if not upload:
             await self._render_and_compose(state, force=True)
             return CycleResult("rendered", reason="preview, not uploaded")
@@ -162,6 +176,7 @@ class Service:
             await retry(lambda: frame.select(content_id, show=power == "art"), s.retries, "Select")
             state.current_id = content_id
             state.last_hash = new_hash
+            state.cards_on_screen = self._last_had_cards
             now = self.clock().astimezone()
             state.last_upload = now.isoformat(timespec="seconds")
             self.store.save(state)
@@ -177,7 +192,12 @@ class Service:
         started = time.monotonic()
         if s.layout == "cards":
             layout = LayoutStore(s.cards_file).load()
-            png = await retry(lambda: self.card_renderer(s, layout), s.retries, "Render")
+            self._last_had_cards = self.cards_wanted(state)
+            if not self._last_had_cards:
+                layout = {**layout, "cards": self._art_only_cards(state)}
+            art = self.gallery.current_path(state.gallery) if s.gallery else None
+            render_settings = replace(s, style="image", bg_image=str(art)) if art else s
+            png = await retry(lambda: self.card_renderer(render_settings, layout), s.retries, "Render")
         else:
             png = await retry(lambda: self.renderer(s), s.retries, "Render")
         shot = compose.load(png)
@@ -204,6 +224,108 @@ class Service:
         if s.debug_images:
             self._save_debug(png, jpeg)
         return image, jpeg, new_hash, distance
+
+    # -- cards on demand ----------------------------------------------------
+
+    def cards_wanted(self, state: State) -> bool:
+        """Whether the picture should carry the cards right now."""
+        if not self.settings.cards_on_demand:
+            return True
+        if not state.cards_until:
+            return False
+        try:
+            until = datetime.fromisoformat(state.cards_until)
+        except ValueError:
+            return False
+        return self.clock().astimezone() < until
+
+    def show_cards(self, minutes: int | None = None) -> str:
+        """Show the cards for ``minutes`` (default CARDS_MINUTES) from now. Returns the end time."""
+        minutes = max(1, int(minutes or self.settings.cards_minutes))
+        until = (self.clock().astimezone() + timedelta(minutes=minutes)).isoformat(timespec="seconds")
+        state = self.store.load()
+        state.cards_until = until
+        self.store.save(state)
+        self._wake.set()
+        return until
+
+    def hide_cards(self) -> None:
+        state = self.store.load()
+        state.cards_until = None
+        self.store.save(state)
+        self._wake.set()
+
+    def _art_only_cards(self, state: State) -> list[dict]:
+        art = state.gallery if self.settings.gallery else None
+        if not (art and self.settings.gallery_caption):
+            return []
+        caption = art.get("title", "")
+        who = ", ".join(p for p in (art.get("artist"), art.get("date")) if p)
+        if who:
+            caption = f"{caption} — {who}" if caption else who
+        card = {
+            "id": "caption",
+            "type": "text",
+            "x": 2,
+            "y": 93,
+            "w": 70,
+            "h": 5,
+            "options": {"text": caption, "style": "none", "scale": 55},
+        }
+        return [normalize_card(card)]
+
+    # -- gallery -------------------------------------------------------------
+
+    def gallery_due(self, state: State) -> bool:
+        if self.gallery.current_path(state.gallery) is None:
+            return True
+        try:
+            chosen = datetime.fromisoformat(state.gallery["chosen_at"])
+        except (KeyError, TypeError, ValueError):
+            return True
+        return self.clock().astimezone() - chosen >= timedelta(minutes=self.settings.gallery_interval_min)
+
+    async def _rotate_gallery(self, state: State) -> None:
+        """Pick a new artwork when one is due. Failures keep the current one."""
+        if not self.gallery_due(state):
+            return
+        s = self.settings
+        try:
+            art, path = await self.gallery.pick(
+                s.gallery_query, s.gallery_sources, state.gallery_recent, s.gallery_min_width, s.output_size
+            )
+        except (GalleryError, OSError) as e:
+            log.warning("Gallery: keeping the current picture, no new artwork (%s)", e)
+            return
+        state.gallery = {
+            **art.as_dict(),
+            "file": path.name,
+            "chosen_at": self.clock().astimezone().isoformat(timespec="seconds"),
+        }
+        state.gallery_recent = (state.gallery_recent + [art.key])[-200:]
+        self.store.save(state)
+
+    def next_wake_seconds(self) -> float:
+        """Seconds until the next cycle: the interval, or sooner when cards or the artwork expire."""
+        s = self.settings
+        wait = float(s.interval_min * 60)
+        state = self.store.load()
+        now = self.clock().astimezone()
+        if s.layout == "cards" and s.cards_on_demand and state.cards_until and state.cards_on_screen:
+            try:
+                left = (datetime.fromisoformat(state.cards_until) - now).total_seconds() + 1
+                wait = min(wait, max(1.0, left))
+            except ValueError:
+                pass
+        if s.layout == "cards" and s.gallery and state.gallery and state.gallery.get("chosen_at"):
+            try:
+                due = datetime.fromisoformat(state.gallery["chosen_at"]) + timedelta(
+                    minutes=s.gallery_interval_min
+                )
+                wait = min(wait, max(1.0, (due - now).total_seconds() + 1))
+            except ValueError:
+                pass
+        return wait
 
     def _save_debug(self, png: bytes, jpeg: bytes) -> None:
         try:
@@ -263,7 +385,7 @@ class Service:
         while True:
             self._wake.clear()
             await self.run_cycle()
-            interval = self.settings.interval_min * 60
+            interval = self.next_wake_seconds()
             self.next_run = self.clock() + timedelta(seconds=interval)
             try:
                 await asyncio.wait_for(self._wake.wait(), timeout=interval)

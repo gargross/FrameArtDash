@@ -98,6 +98,18 @@ async def test_refresh_needs_api_key(client):
     assert resp.status == 202
 
 
+async def test_cards_show_hide_need_api_key(client):
+    auth = {"Authorization": f"Bearer {client.auth.api_key}"}
+    assert (await client.post("/cards/show")).status == 401
+    assert (await client.post("/cards/hide")).status == 401
+    resp = await client.post("/cards/show?minutes=5", headers=auth)
+    assert resp.status == 202 and (await resp.json())["cards_until"]
+    assert client.service.store.load().cards_until
+    assert (await client.post("/cards/show?minutes=abc", headers=auth)).status == 400
+    assert (await client.post("/cards/hide", headers=auth)).status == 202
+    assert client.service.store.load().cards_until is None
+
+
 async def test_status_and_history(client):
     await login(client)
     from datetime import datetime
