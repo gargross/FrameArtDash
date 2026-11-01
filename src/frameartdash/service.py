@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import random
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field, replace
@@ -13,7 +16,7 @@ from typing import Any
 from frameartdash import compose, frame as frame_mod, render as render_mod
 from frameartdash.cards.store import LayoutStore, normalize_card
 from frameartdash.config import Settings, in_window
-from frameartdash.gallery import Gallery, GalleryError
+from frameartdash.gallery import Gallery, GalleryError, Library
 from frameartdash.history import History
 from frameartdash.state import State, StateStore
 
@@ -76,6 +79,8 @@ class Service:
         self.store = StateStore(settings.state_file)
         self.history = History(settings.data_dir / "history")
         self.gallery = gallery or Gallery(settings.data_dir / "gallery")
+        self.library = Library(settings.data_dir / "gallery")
+        self.controls_file = settings.data_dir / "controls.json"
         self.lock = asyncio.Lock()
         self.last_result: CycleResult | None = None
         self.last_success: str | None = None
@@ -227,32 +232,50 @@ class Service:
 
     # -- cards on demand ----------------------------------------------------
 
-    def cards_wanted(self, state: State) -> bool:
+    # Cards-until and hold live in their own file: they are changed from the web API while a
+    # cycle may be running, and a cycle saving state.json must not overwrite them.
+    def controls(self) -> dict:
+        try:
+            data = json.loads(self.controls_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        return {"cards_until": data.get("cards_until"), "hold": bool(data.get("hold", False))}
+
+    def _save_controls(self, **changes) -> dict:
+        data = {**self.controls(), **changes}
+        self.controls_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.controls_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data))
+        os.replace(tmp, self.controls_file)
+        return data
+
+    def cards_wanted(self, state: State | None = None) -> bool:
         """Whether the picture should carry the cards right now."""
         if not self.settings.cards_on_demand:
             return True
-        if not state.cards_until:
+        until = self.controls()["cards_until"]
+        if not until:
             return False
         try:
-            until = datetime.fromisoformat(state.cards_until)
+            return self.clock().astimezone() < datetime.fromisoformat(until)
         except ValueError:
             return False
-        return self.clock().astimezone() < until
 
     def show_cards(self, minutes: int | None = None) -> str:
         """Show the cards for ``minutes`` (default CARDS_MINUTES) from now. Returns the end time."""
         minutes = max(1, int(minutes or self.settings.cards_minutes))
         until = (self.clock().astimezone() + timedelta(minutes=minutes)).isoformat(timespec="seconds")
-        state = self.store.load()
-        state.cards_until = until
-        self.store.save(state)
+        self._save_controls(cards_until=until)
         self._wake.set()
         return until
 
     def hide_cards(self) -> None:
-        state = self.store.load()
-        state.cards_until = None
-        self.store.save(state)
+        self._save_controls(cards_until=None)
+        self._wake.set()
+
+    def set_hold(self, hold: bool) -> None:
+        """Keep the current artwork (no rotation) until released."""
+        self._save_controls(hold=bool(hold))
         self._wake.set()
 
     def _art_only_cards(self, state: State) -> list[dict]:
@@ -285,25 +308,55 @@ class Service:
             return True
         return self.clock().astimezone() - chosen >= timedelta(minutes=self.settings.gallery_interval_min)
 
-    async def _rotate_gallery(self, state: State) -> None:
-        """Pick a new artwork when one is due. Failures keep the current one."""
-        if not self.gallery_due(state):
-            return
+    async def _rotate_gallery(self, state: State, force: bool = False) -> None:
+        """Pick a new artwork when one is due (or ``force``). Failures keep the current one."""
+        if not force and (self.controls()["hold"] or not self.gallery_due(state)):
+            if self.gallery.current_path(state.gallery) is not None:
+                return
         s = self.settings
+        rule = self.library.active_rule(self.clock().astimezone())
         try:
-            art, path = await self.gallery.pick(
-                s.gallery_query, s.gallery_sources, state.gallery_recent, s.gallery_min_width, s.output_size
-            )
+            if rule and rule["source"] == "collection" and self.library.collection():
+                items = self.library.collection()
+                n = len(items) - 1  # avoid the last n picks, so every item comes round before a repeat
+                recent = set(state.gallery_recent[-n:]) if n > 0 else set()
+                fresh = [i for i in items if i["key"] not in recent]
+                key = random.choice(fresh or items)["key"]
+                art, path = await self.gallery.fetch(key, s.output_size)
+            else:
+                query = (rule or {}).get("query") or s.gallery_query
+                art, path = await self.gallery.pick(
+                    query, s.gallery_sources, state.gallery_recent, s.gallery_min_width, s.output_size
+                )
         except (GalleryError, OSError) as e:
             log.warning("Gallery: keeping the current picture, no new artwork (%s)", e)
             return
+        self._remember_artwork(state, art, path)
+
+    def _remember_artwork(self, state: State, art, path) -> None:
         state.gallery = {
             **art.as_dict(),
             "file": path.name,
             "chosen_at": self.clock().astimezone().isoformat(timespec="seconds"),
         }
-        state.gallery_recent = (state.gallery_recent + [art.key])[-200:]
+        state.gallery_recent = [k for k in state.gallery_recent if k != art.key][-199:] + [art.key]
+        state.last_hash = None  # a new painting always goes to the TV
         self.store.save(state)
+
+    async def gallery_show(self, key: str) -> dict:
+        """Make one hand-picked artwork the current painting (it stays for a full interval)."""
+        async with self.lock:
+            state = self.store.load()
+            art, path = await self.gallery.fetch(key, self.settings.output_size)
+            self._remember_artwork(state, art, path)
+            return state.gallery
+
+    async def gallery_next(self) -> dict | None:
+        """Skip to the next artwork now, following the schedule."""
+        async with self.lock:
+            state = self.store.load()
+            await self._rotate_gallery(state, force=True)
+            return state.gallery
 
     def next_wake_seconds(self) -> float:
         """Seconds until the next cycle: the interval, or sooner when cards or the artwork expire."""
@@ -311,13 +364,20 @@ class Service:
         wait = float(s.interval_min * 60)
         state = self.store.load()
         now = self.clock().astimezone()
-        if s.layout == "cards" and s.cards_on_demand and state.cards_until and state.cards_on_screen:
+        controls = self.controls()
+        if s.layout == "cards" and s.cards_on_demand and controls["cards_until"] and state.cards_on_screen:
             try:
-                left = (datetime.fromisoformat(state.cards_until) - now).total_seconds() + 1
+                left = (datetime.fromisoformat(controls["cards_until"]) - now).total_seconds() + 1
                 wait = min(wait, max(1.0, left))
             except ValueError:
                 pass
-        if s.layout == "cards" and s.gallery and state.gallery and state.gallery.get("chosen_at"):
+        if (
+            s.layout == "cards"
+            and s.gallery
+            and not controls["hold"]
+            and state.gallery
+            and state.gallery.get("chosen_at")
+        ):
             try:
                 due = datetime.fromisoformat(state.gallery["chosen_at"]) + timedelta(
                     minutes=s.gallery_interval_min

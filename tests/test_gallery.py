@@ -235,3 +235,102 @@ async def test_cards_always_without_on_demand(tmp_path):
     (tmp_path / "cards.json").write_text('{"version": 1, "cards": [{"type": "clock"}]}')
     await svc.run_cycle()
     assert [c["type"] for c in rendered[-1][1]["cards"]] == ["clock"]
+
+
+async def test_search_pages_and_items(tmp_path):
+    g, server, seen = await _gallery(tmp_path)
+    try:
+        met = await g.search("met", "harbour", 0, per_page=2)
+        assert [i["key"] for i in met["items"]] == ["met:1", "met:2"] and met["more"] is True
+        assert met["items"][0]["thumb"].endswith("/img/wide.jpg")
+        page2 = await g.search("met", "harbour", 1, per_page=2)
+        assert [i["key"] for i in page2["items"]] == ["met:4"]  # met:3 is not public domain
+        cma = await g.search("cleveland", "fields", 0)
+        assert [i["landscape"] for i in cma["items"]] == [True, False]
+        assert seen[-1]["skip"] == "0" and seen[-1]["limit"] == "24"
+    finally:
+        await server.close()
+
+
+async def test_fetch_by_key_allows_hand_picked_portrait(tmp_path):
+    g, server, _ = await _gallery(tmp_path)
+    try:
+        art, path = await g.fetch("met:4", (384, 216))
+        assert art.title == "Portrait" and path.name == "met-4.jpg"
+        try:
+            await g.fetch("met:3", (384, 216))
+            raise AssertionError("copyrighted work must be refused")
+        except GalleryError:
+            pass
+    finally:
+        await server.close()
+
+
+def test_library_collection_and_schedule(tmp_path):
+    from frameartdash.config import ConfigError
+    from frameartdash.gallery import Library
+
+    lib = Library(tmp_path)
+    items = lib.save_collection(
+        [{"key": "met:1", "title": "A"}, {"key": "met:1"}, {"key": "cleveland:9", "x": 1}]
+    )
+    assert [i["key"] for i in items] == ["met:1", "cleveland:9"] and "x" not in items[1]
+    try:
+        lib.save_collection([{"key": "louvre:1"}])
+        raise AssertionError("unknown source must be refused")
+    except ValueError:
+        pass
+
+    lib.save_schedule(
+        {
+            "rules": [
+                {"days": ["sat", "sun"], "start": "08:00", "end": "12:00", "source": "collection"},
+                {"start": "18:00", "end": "06:00", "source": "search", "query": "nocturne"},
+            ]
+        }
+    )
+    assert lib.active_rule(datetime(2026, 10, 31, 9))["source"] == "collection"  # Saturday
+    assert lib.active_rule(datetime(2026, 11, 2, 9)) is None  # Monday morning
+    assert lib.active_rule(datetime(2026, 11, 2, 23))["query"] == "nocturne"
+    try:
+        lib.save_schedule({"rules": [{"start": "25:00", "end": "26:00"}]})
+        raise AssertionError("bad times must be refused")
+    except ConfigError:
+        pass
+
+
+async def test_schedule_collection_rotation_show_and_hold(tmp_path):
+    now = [datetime(2026, 10, 31, 9)]  # Saturday
+    svc, rendered, _ = _cards_service(tmp_path, lambda: now[0])
+
+    fetched = []
+
+    async def fetch(key, size, min_width=1280):
+        fetched.append(key)
+        source, _, ident = key.partition(":")
+        art = Artwork(source, ident, f"Fav {ident}")
+        return art, svc.gallery._store(art, _jpeg(64, 36))
+
+    svc.gallery.fetch = fetch
+    svc.library.save_collection([{"key": "met:7"}, {"key": "met:8"}])
+    svc.library.save_schedule(
+        {"rules": [{"days": ["sat"], "start": "08:00", "end": "12:00", "source": "collection"}]}
+    )
+
+    await svc.run_cycle()
+    now[0] += timedelta(minutes=61)
+    await svc.run_cycle()
+    assert sorted(fetched) == ["met:7", "met:8"]  # both favourites before any repeat
+    assert svc.gallery.picks == 0  # no museum search during the collection rule
+
+    current = await svc.gallery_show("met:42")
+    assert current["title"] == "Fav 42" and fetched[-1] == "met:42"
+
+    svc.set_hold(True)
+    now[0] += timedelta(hours=3)
+    await svc.run_cycle()
+    assert svc.store.load().gallery["id"] == "42"  # held: no rotation
+
+    svc.set_hold(False)
+    await svc.gallery_next()
+    assert svc.gallery.picks == 1  # 12:01 is outside the rule: museum search

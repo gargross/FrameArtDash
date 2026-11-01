@@ -607,6 +607,16 @@ def card_energy(card, o, data: CardData) -> str:
     return f'<div class="energy">{svg}{"".join(nodes)}</div>'
 
 
+def _empty_hidden(card: dict, data: CardData) -> bool:
+    """A calendar card set to hide itself has no events (and its data loaded without error)."""
+    return (
+        card["type"] == "calendar"
+        and bool(card["options"].get("hide_if_empty"))
+        and card["id"] not in data.errors
+        and not data.events.get(card["id"])
+    )
+
+
 def card_calendar(card, o, data: CardData) -> str:
     loc = data.locale
     title = f'<div class="title">{escape(o["title"])}</div>' if o.get("title") else ""
@@ -802,7 +812,7 @@ def build_page(layout: dict, data: CardData, background: str, inline_assets: boo
     # Text without a card needs a halo that contrasts with the text color.
     dark_text = (0.299 * r + 0.587 * g + 0.114 * b) < 128
     halo = "255,255,255" if dark_text else "0,0,0"
-    cards = [c for c in layout["cards"] if edit or visible(c, data.states)]
+    cards = [c for c in layout["cards"] if edit or (visible(c, data.states) and not _empty_hidden(c, data))]
     body = "".join(render_card(c, data, s.get("card_style", "glass"), edit) for c in cards)
     font = FONTS.get(s.get("font"), FONTS["sans"])
     css = CSS.replace(

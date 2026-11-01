@@ -117,6 +117,81 @@ class Gallery:
                 "no suitable artwork found" + (f" ({'; '.join(errors[-3:])})" if errors else "")
             )
 
+    async def search(self, source: str, query: str, page: int = 0, per_page: int = 24) -> dict:
+        """One page of public-domain paintings for the gallery browser."""
+        timeout = aiohttp.ClientTimeout(total=60)
+        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": USER_AGENT}) as session:
+            if source == "cleveland":
+                params = {
+                    "q": query or "landscape",
+                    "type": "Painting",
+                    "cc0": "1",
+                    "has_image": "1",
+                    "limit": str(per_page),
+                    "skip": str(page * per_page),
+                }
+                data = await _json(session, f"{self.cma_api}?{urlencode(params)}")
+                items = [_cma_item(a) for a in data.get("data") or []]
+                total = int((data.get("info") or {}).get("total") or len(items))
+                return {
+                    "items": [i for i in items if i],
+                    "total": total,
+                    "page": page,
+                    "more": (page + 1) * per_page < total,
+                }
+            if source != "met":
+                raise ValueError(f"unknown source {source!r}")
+            ids = await self._cached(("met", query), lambda: self._met_ids(session, query))
+            chunk = ids[page * per_page : (page + 1) * per_page]
+            sem = asyncio.Semaphore(6)
+
+            async def one(object_id):
+                async with sem:
+                    try:
+                        o = await _json(session, f"{self.met_api}/objects/{object_id}")
+                    except (aiohttp.ClientError, TimeoutError, ValueError):
+                        return None
+                return _met_item(object_id, o)
+
+            items = await asyncio.gather(*(one(i) for i in chunk))
+            return {
+                "items": [i for i in items if i],
+                "total": len(ids),
+                "page": page,
+                "more": (page + 1) * per_page < len(ids),
+            }
+
+    async def fetch(self, key: str, size: tuple[int, int], min_width: int = 1280) -> tuple[Artwork, Path]:
+        """Download one specific artwork (``met:123`` / ``cleveland:456``) chosen by hand."""
+        source, _, ident = key.partition(":")
+        timeout = aiohttp.ClientTimeout(total=180)
+        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": USER_AGENT}) as session:
+            if source == "met":
+                art = await self._met_object(session, ident)
+            elif source == "cleveland":
+                data = await _json(session, f"{self.cma_api.rstrip('/')}/{ident}")
+                item = _cma_item(data.get("data") or {})
+                art = (
+                    Artwork(
+                        **{
+                            k: item[k]
+                            for k in ("source", "id", "title", "artist", "date", "url", "image_url")
+                        }
+                    )
+                    if item
+                    else None
+                )
+            else:
+                raise GalleryError(f"unknown artwork {key!r}")
+            if art is None:
+                raise GalleryError(f"{key} is not a public-domain work with an image")
+            try:
+                data = await self._download(session, art.image_url)
+                jpeg = await asyncio.to_thread(_fit, data, min_width, size, 0)
+            except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as e:
+                raise GalleryError(f"{key}: {e}") from e
+        return art, self._store(art, jpeg)
+
     def current_path(self, art: dict | None) -> Path | None:
         if not art or not art.get("file"):
             return None
@@ -170,26 +245,12 @@ class Gallery:
         data = await _json(session, f"{self.cma_api}?{urlencode(params)}")
         arts = []
         for a in data.get("data") or []:
-            img = (a.get("images") or {}).get("print") or {}
-            if a.get("share_license_status") not in (None, "CC0") or not img.get("url"):
-                continue
-            try:
-                width, height = int(img.get("width") or 0), int(img.get("height") or 0)
-            except ValueError:
-                width = height = 0
-            if width and height and width < height * MIN_ASPECT:
+            item = _cma_item(a)
+            if not item or item["landscape"] is False:
                 continue  # portrait or square: skip without downloading
-            creators = a.get("creators") or []
-            artist = (creators[0].get("description") or "").split("(")[0].strip() if creators else ""
             arts.append(
                 Artwork(
-                    source="cleveland",
-                    id=str(a.get("id")),
-                    title=(a.get("title") or "Untitled").strip(),
-                    artist=artist,
-                    date=(a.get("creation_date") or "").strip(),
-                    url=a.get("url") or "",
-                    image_url=img["url"],
+                    **{k: item[k] for k in ("source", "id", "title", "artist", "date", "url", "image_url")}
                 )
             )
         return arts
@@ -230,7 +291,7 @@ async def _json(session, url: str) -> dict:
     return data
 
 
-def _fit(data: bytes, min_width: int, size: tuple[int, int]) -> bytes:
+def _fit(data: bytes, min_width: int, size: tuple[int, int], min_aspect: float = MIN_ASPECT) -> bytes:
     """Validate and crop to the output size. Raises ValueError for unsuitable images."""
     Image.MAX_IMAGE_PIXELS = 400_000_000  # museum scans are large but trusted sources
     with Image.open(io.BytesIO(data)) as img:
@@ -238,9 +299,141 @@ def _fit(data: bytes, min_width: int, size: tuple[int, int]) -> bytes:
         width, height = img.size
         if width < min_width:
             raise ValueError(f"too small ({width}px wide)")
-        if width < height * MIN_ASPECT:
+        if min_aspect and width < height * min_aspect:
             raise ValueError(f"not landscape ({width}x{height})")
         fitted = ImageOps.fit(img.convert("RGB"), size, Image.Resampling.LANCZOS)
     out = io.BytesIO()
     fitted.save(out, "JPEG", quality=92)
     return out.getvalue()
+
+
+def _met_item(object_id, o: dict) -> dict | None:
+    if not o.get("isPublicDomain") or not o.get("primaryImage"):
+        return None
+    return {
+        "key": f"met:{object_id}",
+        "source": "met",
+        "id": str(object_id),
+        "title": (o.get("title") or "Untitled").strip(),
+        "artist": (o.get("artistDisplayName") or "").strip(),
+        "date": (o.get("objectDate") or "").strip(),
+        "url": o.get("objectURL") or "",
+        "image_url": o["primaryImage"],
+        "thumb": o.get("primaryImageSmall") or o["primaryImage"],
+        "width": None,
+        "height": None,
+        "landscape": None,
+    }
+
+
+def _cma_item(a: dict) -> dict | None:
+    images = a.get("images") or {}
+    img = images.get("print") or {}
+    if a.get("share_license_status") not in (None, "CC0") or not img.get("url"):
+        return None
+    try:
+        width, height = int(img.get("width") or 0), int(img.get("height") or 0)
+    except ValueError:
+        width = height = 0
+    creators = a.get("creators") or []
+    artist = (creators[0].get("description") or "").split("(")[0].strip() if creators else ""
+    return {
+        "key": f"cleveland:{a.get('id')}",
+        "source": "cleveland",
+        "id": str(a.get("id")),
+        "title": (a.get("title") or "Untitled").strip(),
+        "artist": artist,
+        "date": (a.get("creation_date") or "").strip(),
+        "url": a.get("url") or "",
+        "image_url": img["url"],
+        "thumb": (images.get("web") or {}).get("url") or img["url"],
+        "width": width or None,
+        "height": height or None,
+        "landscape": (width >= height * MIN_ASPECT) if width and height else None,
+    }
+
+
+ITEM_FIELDS = ("key", "source", "id", "title", "artist", "date", "url", "thumb")
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+class Library:
+    """The user's saved collection and rotation schedule, stored next to the artwork files."""
+
+    def __init__(self, directory: Path) -> None:
+        self.dir = directory
+
+    def _read(self, name: str, default):
+        try:
+            return json.loads((self.dir / name).read_text())
+        except FileNotFoundError:
+            return default
+        except (OSError, json.JSONDecodeError) as e:
+            log.warning("Could not read %s (%s)", name, e)
+            return default
+
+    def _write(self, name: str, data) -> None:
+        self.dir.mkdir(parents=True, exist_ok=True)
+        tmp = self.dir / (name + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(self.dir / name)
+
+    # collection
+    def collection(self) -> list[dict]:
+        return list(self._read("collection.json", []))
+
+    def save_collection(self, items: list) -> list[dict]:
+        clean, seen = [], set()
+        for raw in items or []:
+            if not isinstance(raw, dict):
+                raise ValueError("collection items must be objects")
+            item = {k: str(raw.get(k) or "") for k in ITEM_FIELDS}
+            source, _, ident = item["key"].partition(":")
+            if source not in SOURCES or not ident:
+                raise ValueError(f"invalid artwork key {item['key']!r}")
+            item["source"], item["id"] = source, ident
+            if item["key"] not in seen:
+                seen.add(item["key"])
+                clean.append(item)
+        self._write("collection.json", clean)
+        return clean
+
+    # schedule
+    def schedule(self) -> dict:
+        return self._read("schedule.json", {"rules": []})
+
+    def save_schedule(self, data: dict) -> dict:
+        from frameartdash.config import parse_active_hours
+
+        rules = []
+        for raw in (data or {}).get("rules") or []:
+            days = [d for d in (raw.get("days") or list(WEEKDAYS)) if d in WEEKDAYS]
+            start, end = str(raw.get("start") or ""), str(raw.get("end") or "")
+            parse_active_hours(f"{start}-{end}")  # raises ConfigError on bad times
+            source = raw.get("source") if raw.get("source") in ("search", "collection") else "search"
+            rules.append(
+                {
+                    "days": days or list(WEEKDAYS),
+                    "start": start,
+                    "end": end,
+                    "source": source,
+                    "query": str(raw.get("query") or "").strip(),
+                }
+            )
+        saved = {"rules": rules}
+        self._write("schedule.json", saved)
+        return saved
+
+    def active_rule(self, now) -> dict | None:
+        """The first rule whose days and time window contain ``now`` (local time)."""
+        from frameartdash.config import in_window, parse_active_hours
+
+        day = WEEKDAYS[now.weekday()]
+        for rule in self.schedule().get("rules") or []:
+            try:
+                window = parse_active_hours(f"{rule['start']}-{rule['end']}")
+            except Exception:  # noqa: BLE001 - a broken rule must not stop rotation
+                continue
+            if day in rule.get("days", WEEKDAYS) and in_window(window, now.time()):
+                return rule
+        return None
