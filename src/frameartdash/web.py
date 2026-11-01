@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import json
 import logging
 import signal
 import time
+from datetime import datetime, timedelta
 from importlib import resources
 
+import aiohttp
 from aiohttp import web
 
 from frameartdash import __version__, frame as frame_mod
@@ -18,6 +21,7 @@ from frameartdash.cards import page as cards_page
 from frameartdash.cards.schema import schema_json
 from frameartdash.cards.store import LayoutError, LayoutStore
 from frameartdash.config import FIELDS, GROUPS, SECRET_KEYS, ConfigError, SettingsStore
+from frameartdash.gallery import GalleryError
 from frameartdash.ha import HAClient, HAError
 from frameartdash.service import Service
 
@@ -178,7 +182,8 @@ async def status(request: web.Request) -> web.Response:
             "last_success": service.last_success,
             "next_run": service.next_run.isoformat(timespec="seconds") if service.next_run else None,
             "current_id": state.current_id,
-            "cards_until": state.cards_until,
+            "cards_until": service.controls()["cards_until"],
+            "hold": service.controls()["hold"],
             "cards_on_screen": state.cards_on_screen,
             "gallery": state.gallery,
             "last_upload": state.last_upload,
@@ -480,6 +485,150 @@ async def cards_hide(request: web.Request) -> web.Response:
     return web.json_response({"status": "accepted"}, status=202)
 
 
+# -- gallery (web UI, session auth) -------------------------------------------
+
+
+async def gallery_page(request: web.Request) -> web.Response:
+    return web.Response(text=_page("gallery.html"), content_type="text/html")
+
+
+def _gallery_overview(service: Service) -> dict:
+    s = service.settings
+    state = service.store.load()
+    controls = service.controls()
+    rule = service.library.active_rule(service.clock().astimezone())
+    return {
+        "enabled": s.layout == "cards" and s.gallery,
+        "layout": s.layout,
+        "interval_min": s.gallery_interval_min,
+        "default_query": s.gallery_query,
+        "sources": list(s.gallery_sources),
+        "cards_on_demand": s.cards_on_demand,
+        "cards_minutes": s.cards_minutes,
+        "cards_until": controls["cards_until"],
+        "cards_shown": service.cards_wanted(state),
+        "hold": controls["hold"],
+        "current": state.gallery,
+        "next_change": (
+            (
+                datetime.fromisoformat(state.gallery["chosen_at"]) + timedelta(minutes=s.gallery_interval_min)
+            ).isoformat(timespec="seconds")
+            if state.gallery and state.gallery.get("chosen_at") and not controls["hold"]
+            else None
+        ),
+        "active_rule": rule,
+        "collection": service.library.collection(),
+        "schedule": service.library.schedule(),
+        "busy": service.lock.locked(),
+    }
+
+
+async def gallery_overview(request: web.Request) -> web.Response:
+    return web.json_response(_gallery_overview(request.app[SERVICE]))
+
+
+async def gallery_current_image(request: web.Request) -> web.StreamResponse:
+    service = request.app[SERVICE]
+    path = service.gallery.current_path(service.store.load().gallery)
+    if path is None:
+        raise web.HTTPNotFound()
+    return web.FileResponse(path, headers={"Cache-Control": "no-cache"})
+
+
+async def gallery_search(request: web.Request) -> web.Response:
+    service = request.app[SERVICE]
+    source = request.query.get("source", "met")
+    try:
+        page = max(0, int(request.query.get("page") or 0))
+    except ValueError:
+        return _json_error("page must be a number")
+    try:
+        async with asyncio.timeout(90):
+            result = await service.gallery.search(source, request.query.get("q", "").strip(), page)
+    except (ValueError, GalleryError) as e:
+        return _json_error(str(e))
+    except (aiohttp.ClientError, TimeoutError) as e:
+        return _json_error(f"{source} did not answer ({e or type(e).__name__})", 502)
+    return web.json_response(result)
+
+
+async def _json_body(request: web.Request) -> dict:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise web.HTTPBadRequest(text='{"error": "invalid JSON"}', content_type="application/json") from None
+    if not isinstance(body, dict):
+        raise web.HTTPBadRequest(text='{"error": "expected an object"}', content_type="application/json")
+    return body
+
+
+async def gallery_show(request: web.Request) -> web.Response:
+    service = request.app[SERVICE]
+    key = str((await _json_body(request)).get("key") or "")
+    try:
+        async with asyncio.timeout(240):
+            current = await service.gallery_show(key)
+    except GalleryError as e:
+        return _json_error(str(e))
+    except TimeoutError:
+        return _json_error("downloading the artwork took too long", 504)
+    _spawn(service.run_cycle(force=True))
+    return web.json_response({"current": current})
+
+
+async def gallery_next(request: web.Request) -> web.Response:
+    service = request.app[SERVICE]
+    try:
+        async with asyncio.timeout(240):
+            current = await service.gallery_next()
+    except TimeoutError:
+        return _json_error("finding an artwork took too long", 504)
+    _spawn(service.run_cycle(force=True))
+    return web.json_response({"current": current})
+
+
+async def gallery_hold(request: web.Request) -> web.Response:
+    service = request.app[SERVICE]
+    service.set_hold(bool((await _json_body(request)).get("hold")))
+    return web.json_response(_gallery_overview(service))
+
+
+async def gallery_collection(request: web.Request) -> web.Response:
+    service = request.app[SERVICE]
+    try:
+        items = service.library.save_collection((await _json_body(request)).get("items"))
+    except ValueError as e:
+        return _json_error(str(e))
+    return web.json_response({"items": items})
+
+
+async def gallery_schedule(request: web.Request) -> web.Response:
+    service = request.app[SERVICE]
+    try:
+        schedule = service.library.save_schedule(await _json_body(request))
+    except (ValueError, ConfigError) as e:
+        return _json_error(str(e))
+    return web.json_response(schedule)
+
+
+async def cards_show_api(request: web.Request) -> web.Response:
+    service = request.app[SERVICE]
+    try:
+        minutes = int((await _json_body(request)).get("minutes") or 0) or None
+    except (TypeError, ValueError):
+        return _json_error("minutes must be a number")
+    until = service.show_cards(minutes)
+    _push_soon(service)
+    return web.json_response({"cards_until": until})
+
+
+async def cards_hide_api(request: web.Request) -> web.Response:
+    service = request.app[SERVICE]
+    service.hide_cards()
+    _push_soon(service)
+    return web.json_response({"cards_until": None})
+
+
 # -- app ----------------------------------------------------------------------
 
 
@@ -501,6 +650,17 @@ def build_app(service: Service, store: SettingsStore, auth: Auth, run_loop: bool
     r.add_post("/refresh", refresh_with_key)
     r.add_post("/cards/show", cards_show)
     r.add_post("/cards/hide", cards_hide)
+    r.add_get("/gallery", gallery_page)
+    r.add_get("/api/gallery", gallery_overview)
+    r.add_get("/api/gallery/current.jpg", gallery_current_image)
+    r.add_get("/api/gallery/search", gallery_search)
+    r.add_post("/api/gallery/show", gallery_show)
+    r.add_post("/api/gallery/next", gallery_next)
+    r.add_post("/api/gallery/hold", gallery_hold)
+    r.add_put("/api/gallery/collection", gallery_collection)
+    r.add_put("/api/gallery/schedule", gallery_schedule)
+    r.add_post("/api/cards/show", cards_show_api)
+    r.add_post("/api/cards/hide", cards_hide_api)
     r.add_get("/api/status", status)
     r.add_get("/api/logs", logs)
     r.add_get("/api/settings", get_settings)

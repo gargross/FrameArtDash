@@ -161,3 +161,29 @@ def test_person_ids_all_exclude_and_only_home():
         "person.nodevice",
         "person.sam",
     ]
+
+
+def test_calendar_hides_itself_when_empty():
+    from frameartdash.cards.data import CardData
+    from frameartdash.cards.store import normalize
+
+    layout = normalize(
+        {
+            "version": 1,
+            "cards": [
+                {"id": "bday", "type": "calendar", "options": {"title": "Birthdays", "hide_if_empty": True}},
+                {"id": "dinner", "type": "calendar", "options": {"title": "Dinners", "hide_if_empty": True}},
+                {"id": "always", "type": "calendar", "options": {"title": "Family"}},
+            ],
+        }
+    )
+    data = CardData(now=NOW, locale=Locale("en"))
+    data.events = {
+        "dinner": [{"summary": "Tacos", "start": {"date": "2026-01-01"}, "calendar": "calendar.x"}]
+    }
+    html = build_page(layout, data, "#000", inline_assets=False)
+    assert "Dinners" in html and "Tacos" in html and "Family" in html
+    assert "Birthdays" not in html
+    assert "Birthdays" in build_page(layout, data, "#000", inline_assets=False, edit=True)  # editor shows it
+    data.errors["bday"] = "HA down"
+    assert "HA down" in build_page(layout, data, "#000", inline_assets=False)  # a failed fetch stays visible

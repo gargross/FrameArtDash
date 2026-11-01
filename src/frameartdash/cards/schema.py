@@ -241,6 +241,13 @@ CARD_TYPES: tuple[CardType, ...] = (
             Opt("entities", "Calendars", "entities", domains=("calendar",)),
             Opt("days", "Days ahead", "number", 7),
             Opt("max_events", "Max events", "number", 6),
+            Opt(
+                "hide_if_empty",
+                "Hide when there are no events",
+                "bool",
+                False,
+                help="The whole card, title included, disappears while the calendars have nothing coming up.",
+            ),
         ),
         "Upcoming events",
     ),

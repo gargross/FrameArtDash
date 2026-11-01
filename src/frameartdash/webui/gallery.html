@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gallery · FrameArtDash</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<style>
+  :root {
+    --bg:#0e1014; --panel:#14171c; --card:#191d23; --line:rgba(235,231,224,.09); --line2:rgba(235,231,224,.16);
+    --text:#ebe7e0; --muted:#9a958d; --faint:#6b675f; --gold:#c9a96e; --gold-soft:rgba(201,169,110,.14);
+    --ok:#8fb38a; --warn:#d6b25e; --bad:#d9826b;
+    --serif:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  * { box-sizing:border-box; }
+  html { color-scheme:dark; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 var(--sans); }
+  a { color:var(--gold); }
+  button, input, select { font:inherit; color:inherit; }
+  .wrap { max-width:1240px; margin:0 auto; padding:0 24px 64px; }
+  header { position:sticky; top:0; z-index:5; background:rgba(14,16,20,.86); backdrop-filter:blur(12px); border-bottom:1px solid var(--line); }
+  header .wrap { display:flex; align-items:center; gap:16px; padding-top:14px; padding-bottom:14px; }
+  .brand { display:flex; align-items:center; gap:10px; font:500 20px var(--serif); }
+  .brand svg { width:26px; height:26px; }
+  nav { display:flex; gap:4px; margin-left:12px; }
+  nav a { padding:6px 14px; border-radius:999px; color:var(--muted); text-decoration:none; border:1px solid transparent; font-size:14px; }
+  nav a.active { color:var(--text); border-color:var(--line2); background:var(--panel); }
+  .spacer { flex:1; }
+  .btn { display:inline-flex; align-items:center; justify-content:center; gap:8px; padding:9px 16px; border-radius:10px; border:1px solid var(--line2); background:transparent; color:var(--text); cursor:pointer; font-size:14px; white-space:nowrap; }
+  .btn:hover { border-color:var(--gold); }
+  .btn.primary { background:var(--gold); border-color:var(--gold); color:#16130d; font-weight:600; }
+  .btn.small { padding:6px 12px; font-size:13px; }
+  .btn.ghost { border-color:transparent; color:var(--muted); }
+  .btn.on { border-color:var(--gold); color:var(--gold); background:var(--gold-soft); }
+  .btn[disabled] { opacity:.5; cursor:default; }
+  .btn.danger:hover { border-color:var(--bad); color:var(--bad); }
+  input[type=text], input[type=number], input[type=time], select { background:var(--panel); border:1px solid var(--line2); border-radius:10px; padding:8px 12px; }
+  input:focus, select:focus { outline:none; border-color:var(--gold); }
+  h2 { font:500 13px var(--sans); text-transform:uppercase; letter-spacing:.14em; color:var(--muted); margin:0 0 14px; }
+  section { margin-top:48px; }
+  .banner { margin-top:24px; padding:14px 18px; border:1px solid rgba(214,178,94,.35); background:rgba(214,178,94,.08); border-radius:12px; color:#e5d3a4; }
+  .hidden { display:none !important; }
+
+  .now { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:28px; margin-top:28px; align-items:start; }
+  .frame { padding:18px; background:linear-gradient(145deg,#2a2621,#14120f); border-radius:6px; box-shadow:0 30px 80px rgba(0,0,0,.55), inset 0 0 0 1px rgba(255,255,255,.06); }
+  .mat { background:#0b0c0e; aspect-ratio:16/9; display:grid; place-items:center; overflow:hidden; }
+  .mat img { width:100%; height:100%; object-fit:cover; display:block; }
+  .title { font:400 24px var(--serif); margin:16px 0 2px; }
+  .meta { color:var(--muted); font-size:14px; }
+  .status { display:grid; gap:8px; font-size:14px; color:var(--muted); background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:20px; }
+  .status b { color:var(--text); font-weight:500; }
+  .stack { display:grid; gap:10px; margin-bottom:20px; }
+  .row { display:flex; gap:8px; align-items:center; }
+  .row input[type=number] { width:76px; }
+
+  .searchbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:18px; }
+  .searchbar input { flex:1; min-width:220px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:18px; }
+  .art { background:var(--card); border:1px solid var(--line); border-radius:12px; overflow:hidden; display:flex; flex-direction:column; }
+  .art .pic { aspect-ratio:16/10; background:#0b0c0e; overflow:hidden; }
+  .art img { width:100%; height:100%; object-fit:cover; display:block; }
+  .art .body { padding:10px 12px 12px; display:flex; flex-direction:column; gap:6px; flex:1; }
+  .art .t { font:400 16px/1.25 var(--serif); }
+  .art .a { color:var(--muted); font-size:13px; }
+  .art .tags { display:flex; flex-wrap:wrap; gap:6px; }
+  .tag { font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid var(--line2); color:var(--muted); }
+  .tag.good { color:var(--ok); border-color:rgba(143,179,138,.4); }
+  .tag.meh { color:var(--warn); border-color:rgba(214,178,94,.4); }
+  .art .acts { display:flex; flex-wrap:wrap; gap:8px; margin-top:auto; padding-top:6px; }
+  .more { display:flex; justify-content:center; margin-top:18px; }
+  .note { color:var(--faint); font-size:13px; }
+
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th { text-align:left; font-weight:500; color:var(--muted); padding:8px 6px; border-bottom:1px solid var(--line); font-size:13px; }
+  td { padding:8px 6px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  .days { display:flex; gap:4px; flex-wrap:wrap; }
+  .days label { display:inline-flex; align-items:center; justify-content:center; width:34px; height:30px; border:1px solid var(--line2); border-radius:8px; cursor:pointer; font-size:12px; color:var(--muted); user-select:none; }
+  .days input { display:none; }
+  .days input:checked + span { color:var(--gold); }
+  .days label:has(input:checked) { border-color:var(--gold); background:var(--gold-soft); }
+
+  #toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:#262a31; border:1px solid var(--line2); padding:10px 18px; border-radius:10px; font-size:14px; opacity:0; transition:opacity .2s; pointer-events:none; max-width:90vw; }
+  #toast.show { opacity:1; }
+  #toast.bad { border-color:var(--bad); color:#f0c2b5; }
+  @media (max-width:860px) { .now { grid-template-columns:1fr; } nav { display:none; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="brand">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><rect x="2" y="5" width="28" height="22" rx="2" fill="#0f1216" stroke="#c9a96e" stroke-width="2"/><rect x="7" y="10" width="18" height="12" fill="#c9a96e" opacity=".85"/></svg>
+      FrameArtDash
+    </div>
+    <nav><a href="/">Frame &amp; settings</a><a href="/gallery" class="active">Gallery</a></nav>
+    <div class="spacer"></div>
+    <form method="post" action="/logout"><button class="btn ghost small" type="submit">Sign out</button></form>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="banner hidden" id="offBanner">Museum art is off. Turn on <b>Museum art</b> (and <b>Cards only on request</b> if you want art by default) under <a href="/">Settings → Gallery</a>. Content must be <b>cards</b>.</div>
+
+  <div class="now">
+    <div>
+      <div class="frame"><div class="mat" id="mat"><span class="note">No painting yet</span></div></div>
+      <div class="title" id="artTitle"></div>
+      <div class="meta" id="artMeta"></div>
+    </div>
+    <aside>
+      <h2>On the Frame</h2>
+      <div class="status" id="status">…</div>
+      <div class="stack">
+        <button class="btn primary" id="nextBtn">Next painting</button>
+        <button class="btn" id="holdBtn">Keep this painting</button>
+        <button class="btn" id="saveCurrentBtn">★ Save to my collection</button>
+      </div>
+      <h2>Cards</h2>
+      <div class="stack">
+        <div class="row"><button class="btn" id="showCardsBtn" style="flex:1">Show cards for</button><input type="number" id="cardsMin" min="1" max="720" value="15"><span class="note">min</span></div>
+        <button class="btn" id="hideCardsBtn">Hide cards</button>
+        <button class="btn" id="pushBtn">Push to the Frame now</button>
+      </div>
+    </aside>
+  </div>
+
+  <section>
+    <h2>Find art</h2>
+    <form class="searchbar" id="searchForm">
+      <input type="text" id="q" placeholder="Search paintings — e.g. landscape, nocturne, Monet, winter, sea" autocomplete="off">
+      <select id="source"><option value="met">The Met</option><option value="cleveland">Cleveland Museum of Art</option></select>
+      <button class="btn primary" type="submit">Search</button>
+    </form>
+    <div class="note" id="searchNote">Public-domain paintings only. Wide, large works fill the Frame best.</div>
+    <div class="grid" id="results" style="margin-top:14px"></div>
+    <div class="more hidden" id="moreWrap"><button class="btn" id="moreBtn">Load more</button></div>
+  </section>
+
+  <section>
+    <h2>My collection <span id="collCount" class="note"></span></h2>
+    <div class="note" id="collEmpty">Save paintings with ★ to build a collection. Schedule rules can rotate through it.</div>
+    <div class="grid" id="collection"></div>
+  </section>
+
+  <section>
+    <h2>Schedule</h2>
+    <p class="note">The first rule that matches the current day and time decides where the next painting comes from. Outside all rules: a museum search for <b id="defaultQuery"></b> (Settings → Gallery). Paintings change every <b id="interval"></b> minutes.</p>
+    <table>
+      <thead><tr><th>Days</th><th>From</th><th>To</th><th>Paintings from</th><th>Search terms</th><th></th></tr></thead>
+      <tbody id="rules"></tbody>
+    </table>
+    <div class="row" style="margin-top:14px"><button class="btn" id="addRule">Add rule</button><button class="btn primary" id="saveRules">Save schedule</button></div>
+  </section>
+</div>
+<div id="toast"></div>
+
+<script>
+const DAYS = ["mon","tue","wed","thu","fri","sat","sun"];
+const SOURCES = {met: "The Met", cleveland: "Cleveland Museum of Art"};
+let overview = null, page = 0, lastQuery = null;
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const time = (iso) => iso ? new Date(iso).toLocaleTimeString([], {hour:"numeric", minute:"2-digit"}) : "";
+
+function toast(msg, bad) {
+  const t = $("toast"); t.textContent = msg; t.className = "show" + (bad ? " bad" : "");
+  clearTimeout(t._h); t._h = setTimeout(() => t.className = "", bad ? 6000 : 2600);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {headers: {"Content-Type": "application/json"}, ...opts,
+    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined});
+  if (res.status === 401) { location.href = "/login"; throw new Error("not logged in"); }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+async function busy(btn, label, fn) {
+  const old = btn.textContent; btn.disabled = true; btn.textContent = label;
+  try { return await fn(); } catch (e) { toast(e.message, true); }
+  finally { btn.disabled = false; if (btn.textContent === label) btn.textContent = old; }
+}
+
+// -- overview --------------------------------------------------------------
+async function load() {
+  overview = await api("/api/gallery");
+  $("offBanner").classList.toggle("hidden", overview.enabled);
+  const c = overview.current;
+  $("mat").innerHTML = c ? `<img src="/api/gallery/current.jpg?k=${encodeURIComponent(c.key || c.id)}${encodeURIComponent(c.chosen_at || "")}" alt="">` : `<span class="note">No painting yet</span>`;
+  $("artTitle").textContent = c ? c.title : "";
+  $("artMeta").innerHTML = c ? [esc(c.artist), esc(c.date), `${esc(SOURCES[c.source] || c.source)}${c.url ? ` · <a href="${esc(c.url)}" target="_blank" rel="noopener">museum page</a>` : ""}`].filter(Boolean).join(" · ") : "";
+  const lines = [];
+  if (overview.hold) lines.push(`<b>Kept</b> — this painting stays until you release it.`);
+  else if (overview.next_change) lines.push(`Next painting at <b>${time(overview.next_change)}</b>`);
+  lines.push(overview.cards_on_demand
+    ? (overview.cards_until && overview.cards_shown ? `Cards shown until <b>${time(overview.cards_until)}</b>` : `Cards <b>hidden</b> — painting alone`)
+    : `Cards <b>always shown</b> (Cards only on request is off)`);
+  const r = overview.active_rule;
+  lines.push(r ? `Schedule: <b>${r.source === "collection" ? "my collection" : esc(r.query || overview.default_query)}</b> (${esc(r.start)}–${esc(r.end)})` : `Schedule: <b>${esc(overview.default_query)}</b> (default)`);
+  $("status").innerHTML = lines.map((l) => `<div>${l}</div>`).join("");
+  $("holdBtn").textContent = overview.hold ? "Release — rotate again" : "Keep this painting";
+  $("holdBtn").classList.toggle("on", overview.hold);
+  $("cardsMin").value = $("cardsMin").dataset.touched ? $("cardsMin").value : overview.cards_minutes;
+  $("saveCurrentBtn").disabled = !c || inCollection(`${c.source}:${c.id}`);
+  $("defaultQuery").textContent = overview.default_query;
+  $("interval").textContent = overview.interval_min;
+  renderCollection();
+  if (!$("rules").dataset.dirty) renderRules(overview.schedule.rules || []);
+}
+
+const inCollection = (key) => (overview?.collection || []).some((i) => i.key === key);
+
+async function saveCollection(items, msg) {
+  const res = await api("/api/gallery/collection", {method: "PUT", body: {items}});
+  overview.collection = res.items; renderCollection(); refreshStars(); toast(msg);
+  $("saveCurrentBtn").disabled = !overview.current || inCollection(`${overview.current.source}:${overview.current.id}`);
+}
+
+async function showNow(key, btn) {
+  await busy(btn, "Fetching…", async () => {
+    await api("/api/gallery/show", {method: "POST", body: {key}});
+    toast("On its way to the Frame"); await load(); window.scrollTo({top: 0, behavior: "smooth"});
+  });
+}
+
+// -- art cards -------------------------------------------------------------
+function artCard(item, mode) {
+  const el = document.createElement("div"); el.className = "art";
+  const tags = [];
+  if (item.landscape === true) tags.push(`<span class="tag good">landscape</span>`);
+  if (item.landscape === false) tags.push(`<span class="tag meh">portrait — will be cropped</span>`);
+  if (item.width) tags.push(`<span class="tag ${item.width >= 3000 ? "good" : "meh"}">${item.width}px</span>`);
+  tags.push(`<span class="tag">${esc(SOURCES[item.source] || item.source)}</span>`);
+  el.innerHTML = `<div class="pic"><img loading="lazy" src="${esc(item.thumb)}" alt=""></div>
+    <div class="body"><div class="t">${esc(item.title)}</div><div class="a">${esc([item.artist, item.date].filter(Boolean).join(", "))}</div>
+    <div class="tags">${tags.join("")}</div>
+    <div class="acts"><button class="btn small primary" data-act="show">Show now</button>
+    ${mode === "collection" ? `<button class="btn small danger" data-act="remove">Remove</button>` : `<button class="btn small star" data-act="star"></button>`}
+    ${item.url ? `<a class="btn small ghost" href="${esc(item.url)}" target="_blank" rel="noopener">Info</a>` : ""}</div></div>`;
+  el.dataset.key = item.key;
+  el.querySelector('[data-act="show"]').onclick = (e) => showNow(item.key, e.currentTarget);
+  const star = el.querySelector('[data-act="star"]');
+  if (star) star.onclick = () => {
+    const items = overview.collection.filter((i) => i.key !== item.key);
+    if (inCollection(item.key)) saveCollection(items, "Removed from your collection");
+    else saveCollection([...overview.collection, item], "Saved to your collection");
+  };
+  const rm = el.querySelector('[data-act="remove"]');
+  if (rm) rm.onclick = () => saveCollection(overview.collection.filter((i) => i.key !== item.key), "Removed");
+  return el;
+}
+
+function refreshStars() {
+  document.querySelectorAll("#results .art").forEach((el) => {
+    const s = el.querySelector(".star"), on = inCollection(el.dataset.key);
+    s.textContent = on ? "★ Saved" : "☆ Save"; s.classList.toggle("on", on);
+  });
+}
+
+function renderCollection() {
+  const items = overview.collection || [];
+  $("collection").replaceChildren(...items.map((i) => artCard(i, "collection")));
+  $("collEmpty").classList.toggle("hidden", items.length > 0);
+  $("collCount").textContent = items.length ? `· ${items.length}` : "";
+}
+
+// -- search ----------------------------------------------------------------
+async function search(more) {
+  const q = $("q").value.trim(), source = $("source").value;
+  if (!more) { page = 0; lastQuery = {q, source}; $("results").replaceChildren(); }
+  $("searchNote").textContent = "Searching…";
+  try {
+    const res = await api(`/api/gallery/search?source=${encodeURIComponent(lastQuery.source)}&q=${encodeURIComponent(lastQuery.q)}&page=${page}`);
+    res.items.forEach((i) => $("results").appendChild(artCard(i, "search")));
+    refreshStars();
+    $("moreWrap").classList.toggle("hidden", !res.more);
+    $("searchNote").textContent = res.total ? `${res.total.toLocaleString()} matches at ${SOURCES[lastQuery.source]} — public-domain paintings shown` : "No matches";
+  } catch (e) { $("searchNote").textContent = ""; toast(e.message, true); }
+}
+
+// -- schedule --------------------------------------------------------------
+function ruleRow(rule) {
+  const tr = document.createElement("tr");
+  tr.innerHTML = `<td><div class="days">${DAYS.map((d) => `<label><input type="checkbox" value="${d}" ${rule.days.includes(d) ? "checked" : ""}><span>${d.slice(0,2)}</span></label>`).join("")}</div></td>
+    <td><input type="time" class="start" value="${esc(rule.start)}"></td>
+    <td><input type="time" class="end" value="${esc(rule.end)}"></td>
+    <td><select class="src"><option value="search">Museum search</option><option value="collection">My collection</option></select></td>
+    <td><input type="text" class="query" placeholder="e.g. nocturne" value="${esc(rule.query)}"></td>
+    <td><button class="btn small ghost danger" title="Remove rule">✕</button></td>`;
+  tr.querySelector(".src").value = rule.source;
+  const sync = () => { tr.querySelector(".query").disabled = tr.querySelector(".src").value === "collection"; $("rules").dataset.dirty = "1"; };
+  tr.querySelectorAll("input,select").forEach((i) => i.addEventListener("change", sync));
+  tr.querySelector("button").onclick = () => { tr.remove(); $("rules").dataset.dirty = "1"; };
+  tr.querySelector(".query").disabled = rule.source === "collection";
+  return tr;
+}
+
+function renderRules(rules) { $("rules").replaceChildren(...rules.map(ruleRow)); }
+
+function readRules() {
+  return [...$("rules").children].map((tr) => ({
+    days: [...tr.querySelectorAll(".days input:checked")].map((i) => i.value),
+    start: tr.querySelector(".start").value, end: tr.querySelector(".end").value,
+    source: tr.querySelector(".src").value, query: tr.querySelector(".query").value.trim(),
+  }));
+}
+
+// -- wiring ----------------------------------------------------------------
+$("searchForm").onsubmit = (e) => { e.preventDefault(); search(false); };
+$("moreBtn").onclick = () => { page += 1; search(true); };
+$("nextBtn").onclick = (e) => busy(e.currentTarget, "Finding a painting…", async () => { await api("/api/gallery/next", {method: "POST"}); toast("New painting on its way"); await load(); });
+$("holdBtn").onclick = (e) => busy(e.currentTarget, "…", async () => { await api("/api/gallery/hold", {method: "POST", body: {hold: !overview.hold}}); await load(); });
+$("saveCurrentBtn").onclick = () => { const c = overview.current; saveCollection([...overview.collection, {key: `${c.source}:${c.id}`, source: c.source, id: c.id, title: c.title, artist: c.artist, date: c.date, url: c.url, thumb: c.image_url}], "Saved to your collection"); };
+$("cardsMin").oninput = () => $("cardsMin").dataset.touched = "1";
+$("showCardsBtn").onclick = (e) => busy(e.currentTarget, "…", async () => { await api("/api/cards/show", {method: "POST", body: {minutes: +$("cardsMin").value}}); toast("Cards on their way"); await load(); });
+$("hideCardsBtn").onclick = (e) => busy(e.currentTarget, "…", async () => { await api("/api/cards/hide", {method: "POST"}); toast("Back to the painting"); await load(); });
+$("pushBtn").onclick = (e) => busy(e.currentTarget, "…", async () => { await api("/api/refresh", {method: "POST"}); toast("Pushing to the Frame"); });
+$("addRule").onclick = () => { $("rules").appendChild(ruleRow({days: [...DAYS], start: "18:00", end: "23:00", source: "search", query: "nocturne"})); $("rules").dataset.dirty = "1"; };
+$("saveRules").onclick = (e) => busy(e.currentTarget, "Saving…", async () => {
+  overview.schedule = await api("/api/gallery/schedule", {method: "PUT", body: {rules: readRules()}});
+  delete $("rules").dataset.dirty; renderRules(overview.schedule.rules); toast("Schedule saved"); await load();
+});
+
+load().catch((e) => toast(e.message, true));
+setInterval(() => load().catch(() => {}), 30000);
+</script>
+</body>
+</html>
