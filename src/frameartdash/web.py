@@ -21,7 +21,7 @@ from frameartdash.cards import page as cards_page
 from frameartdash.cards.schema import schema_json
 from frameartdash.cards.store import LayoutError, LayoutStore
 from frameartdash.config import FIELDS, GROUPS, SECRET_KEYS, ConfigError, SettingsStore
-from frameartdash.gallery import GalleryError
+from frameartdash.gallery import LABELS, GalleryError
 from frameartdash.ha import HAClient, HAError
 from frameartdash.service import Service
 
@@ -503,6 +503,8 @@ def _gallery_overview(service: Service) -> dict:
         "interval_min": s.gallery_interval_min,
         "default_query": s.gallery_query,
         "sources": list(s.gallery_sources),
+        "source_labels": LABELS,
+        "exclude": list(s.gallery_exclude),
         "cards_on_demand": s.cards_on_demand,
         "cards_minutes": s.cards_minutes,
         "cards_until": controls["cards_until"],
@@ -544,7 +546,9 @@ async def gallery_search(request: web.Request) -> web.Response:
         return _json_error("page must be a number")
     try:
         async with asyncio.timeout(90):
-            result = await service.gallery.search(source, request.query.get("q", "").strip(), page)
+            result = await service.gallery.search(
+                source, request.query.get("q", "").strip(), page, exclude=service.settings.gallery_exclude
+            )
     except (ValueError, GalleryError) as e:
         return _json_error(str(e))
     except (aiohttp.ClientError, TimeoutError) as e:

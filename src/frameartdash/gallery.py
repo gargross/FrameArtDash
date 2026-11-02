@@ -1,12 +1,15 @@
-"""Public-domain artwork from museum open-access APIs, used as the card background.
+"""Public-domain artwork from museum open-access collections, used as the card background.
 
-Sources (no API key needed):
-- The Met:  https://collectionapi.metmuseum.org/public/collection/v1 (search → object → primaryImage)
-- Cleveland Museum of Art: https://openaccess-api.clevelandart.org/api/artworks (cc0=1, images.print)
+The museums themselves live in :mod:`frameartdash.museums`. This module picks artworks for the
+rotation, serves the gallery browser's searches, downloads and crops the chosen image, and keeps
+the user's collection and schedule (:class:`Library`).
 
-Only public-domain / CC0 works are used. A candidate is accepted when its image is landscape
-(wide enough for a 16:9 screen) and at least ``min_width`` pixels wide; it is then cropped to
-the output size and stored under ``<data>/gallery``.
+Search terms: a comma separates alternatives (OR). Each rotation picks one alternative at random;
+the browser searches all of them. Words within one alternative go to the museum's own search
+(the National Gallery of Art, searched locally, requires every word).
+
+Subjects to leave out (GALLERY_EXCLUDE) are matched as word prefixes against the title and, where
+the museum provides them, its subject tags. Manual "Show now" picks are not filtered.
 """
 
 from __future__ import annotations
@@ -16,23 +19,32 @@ import io
 import json
 import logging
 import random
+import re
 import time
-from dataclasses import asdict, dataclass
 from pathlib import Path
-from urllib.parse import urlencode
 
 import aiohttp
 from PIL import Image, ImageOps
 
+from frameartdash.museums import (
+    AIC,
+    LABELS,
+    MIN_ASPECT,
+    NGA,
+    SOURCES,
+    Artwork,
+    Cleveland,
+    Met,
+    Rijks,
+)
+
+__all__ = ["Artwork", "Gallery", "GalleryError", "Library", "LABELS", "SOURCES", "excluded", "split_terms"]
+
 log = logging.getLogger(__name__)
 
-MET_API = "https://collectionapi.metmuseum.org/public/collection/v1"
-CMA_API = "https://openaccess-api.clevelandart.org/api/artworks/"
-SOURCES = ("met", "cleveland")
-MIN_ASPECT = 1.25  # wider than 5:4, so a 16:9 crop keeps most of the picture
 MAX_BYTES = 80 * 1024 * 1024
 CANDIDATE_TTL = 24 * 3600
-ATTEMPTS = 12
+ATTEMPTS = 14
 USER_AGENT = "FrameArtDash (+https://github.com/cutzenfriend/FrameArtDash)"
 
 
@@ -40,46 +52,52 @@ class GalleryError(RuntimeError):
     pass
 
 
-@dataclass
-class Artwork:
-    source: str
-    id: str
-    title: str
-    artist: str = ""
-    date: str = ""
-    url: str = ""  # museum page
-    image_url: str = ""
+def split_terms(query: str) -> list[str]:
+    """``'seascape, winter harbor'`` → ``['seascape', 'winter harbor']``."""
+    return [t.strip() for t in (query or "").split(",") if t.strip()]
 
-    @property
-    def key(self) -> str:
-        return f"{self.source}:{self.id}"
 
-    @property
-    def caption(self) -> str:
-        who = ", ".join(p for p in (self.artist, self.date) if p)
-        return f"{self.title} — {who}" if who else self.title
-
-    def as_dict(self) -> dict:
-        return asdict(self)
+def excluded(title: str, tags, words) -> str | None:
+    """The first exclusion word found (as a word prefix) in the title or tags, or None."""
+    text = " | ".join([title or "", *(tags or [])])
+    for w in words or ():
+        if w and re.search(r"(?<![\w])" + re.escape(w), text, re.IGNORECASE):
+            return w
+    return None
 
 
 class Gallery:
-    """Picks artworks. Candidate lists are cached per source and query for a day."""
+    """Picks artworks. Candidate lists are cached per source and search term for a day."""
 
     def __init__(
         self,
         directory: Path,
-        met_api: str = MET_API,
-        cma_api: str = CMA_API,
+        met_api: str | None = None,
+        cma_api: str | None = None,
+        aic_api: str | None = None,
+        aic_iiif: str | None = None,
+        nga_data: str | None = None,
+        rijks_api: str | None = None,
         rng: random.Random | None = None,
     ) -> None:
         self.dir = directory
-        self.met_api = met_api.rstrip("/")
-        self.cma_api = cma_api
         self.rng = rng or random.Random()
+        self.sources = {
+            "met": Met(met_api) if met_api else Met(),
+            "cleveland": Cleveland(cma_api) if cma_api else Cleveland(),
+            "aic": AIC(*(a for a in (aic_api, aic_iiif) if a)) if aic_api else AIC(),
+            "nga": NGA(directory, nga_data) if nga_data else NGA(directory),
+            "rijks": Rijks(rijks_api) if rijks_api else Rijks(),
+        }
         self._cache: dict[tuple[str, str], tuple[float, list]] = {}
 
-    # -- public ----------------------------------------------------------------
+    def _session(self, total: int):
+        return aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=total),
+            headers={"User-Agent": USER_AGENT, "AIC-User-Agent": USER_AGENT},
+        )
+
+    # -- rotation --------------------------------------------------------------
 
     async def pick(
         self,
@@ -88,25 +106,37 @@ class Gallery:
         recent: list[str],
         min_width: int,
         size: tuple[int, int],
+        exclude: tuple[str, ...] = (),
     ) -> tuple[Artwork, Path]:
         """Choose, download, crop and store a new artwork. Raises GalleryError if none fits."""
-        timeout = aiohttp.ClientTimeout(total=120)
-        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": USER_AGENT}) as session:
+        terms = split_terms(query) or ["landscape"]
+        usable = [s for s in sources if s in self.sources] or list(SOURCES)
+        async with self._session(180) as session:
             tried: set[str] = set(recent)
             errors: list[str] = []
             for _ in range(ATTEMPTS):
-                source = self.rng.choice([s for s in sources if s in SOURCES] or list(SOURCES))
+                source, term = self.rng.choice(usable), self.rng.choice(terms)
+                src = self.sources[source]
                 try:
-                    art = await self._candidate(session, source, query, tried)
-                except (aiohttp.ClientError, TimeoutError, ValueError, KeyError) as e:
-                    errors.append(f"{source}: {e}")
+                    items = await self._cached((source, term), lambda s=src, t=term: s.candidates(session, t))
+                    fresh = [i for i in items if i["key"] not in tried]
+                    if not fresh:
+                        continue
+                    it = self.rng.choice(fresh)
+                    tried.add(it["key"])
+                    if it.get("title") and excluded(it["title"], it.get("tags"), exclude):
+                        continue
+                    art = await src.resolve(session, it)
+                except (aiohttp.ClientError, TimeoutError, ValueError, KeyError, OSError) as e:
+                    errors.append(f"{source}: {e or type(e).__name__}")
                     continue
                 if art is None:
                     continue
-                tried.add(art.key)
+                if hit := excluded(art.title, art.tags, exclude):
+                    log.debug("Skipping %s (%s): subject '%s' is excluded", art.key, art.title, hit)
+                    continue
                 try:
-                    data = await self._download(session, art.image_url)
-                    jpeg = await asyncio.to_thread(_fit, data, min_width, size)
+                    jpeg = await self._image(session, art, min_width, size, MIN_ASPECT)
                 except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as e:
                     log.debug("Skipping %s: %s", art.key, e)
                     continue
@@ -117,77 +147,64 @@ class Gallery:
                 "no suitable artwork found" + (f" ({'; '.join(errors[-3:])})" if errors else "")
             )
 
-    async def search(self, source: str, query: str, page: int = 0, per_page: int = 24) -> dict:
-        """One page of public-domain paintings for the gallery browser."""
-        timeout = aiohttp.ClientTimeout(total=60)
-        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": USER_AGENT}) as session:
-            if source == "cleveland":
-                params = {
-                    "q": query or "landscape",
-                    "type": "Painting",
-                    "cc0": "1",
-                    "has_image": "1",
-                    "limit": str(per_page),
-                    "skip": str(page * per_page),
-                }
-                data = await _json(session, f"{self.cma_api}?{urlencode(params)}")
-                items = [_cma_item(a) for a in data.get("data") or []]
-                total = int((data.get("info") or {}).get("total") or len(items))
-                return {
-                    "items": [i for i in items if i],
-                    "total": total,
-                    "page": page,
-                    "more": (page + 1) * per_page < total,
-                }
-            if source != "met":
-                raise ValueError(f"unknown source {source!r}")
-            ids = await self._cached(("met", query), lambda: self._met_ids(session, query))
-            chunk = ids[page * per_page : (page + 1) * per_page]
-            sem = asyncio.Semaphore(6)
+    async def _image(self, session, art: Artwork, min_width, size, min_aspect) -> bytes:
+        last: Exception | None = None
+        for url in [art.image_url, *art.fallback_urls]:
+            try:
+                data = await self._download(session, url)
+                return await asyncio.to_thread(_fit, data, min_width, size, min_aspect)
+            except aiohttp.ClientResponseError as e:
+                last = e  # e.g. a size the image server refuses: try the next one
+            except ValueError as e:
+                last = e
+                if "too small" not in str(e):
+                    break
+        raise last or ValueError("no image")
 
-            async def one(object_id):
-                async with sem:
-                    try:
-                        o = await _json(session, f"{self.met_api}/objects/{object_id}")
-                    except (aiohttp.ClientError, TimeoutError, ValueError):
-                        return None
-                return _met_item(object_id, o)
+    # -- browser ---------------------------------------------------------------
 
-            items = await asyncio.gather(*(one(i) for i in chunk))
-            return {
-                "items": [i for i in items if i],
-                "total": len(ids),
-                "page": page,
-                "more": (page + 1) * per_page < len(ids),
-            }
+    async def search(
+        self, source: str, query: str, page: int = 0, per_page: int = 24, exclude: tuple[str, ...] = ()
+    ) -> dict:
+        """One page of public-domain paintings for the gallery browser (all comma alternatives)."""
+        if source not in self.sources:
+            raise ValueError(f"unknown source {source!r}")
+        src = self.sources[source]
+        terms = split_terms(query) or ["landscape"]
+        async with self._session(120) as session:
+            pages = await asyncio.gather(*(src.search(session, t, page, per_page) for t in terms))
+        items, seen, hidden = [], set(), 0
+        for p in pages:
+            for it in p["items"]:
+                if it["key"] in seen:
+                    continue
+                seen.add(it["key"])
+                if excluded(it["title"], it.get("tags"), exclude):
+                    hidden += 1
+                    continue
+                items.append({k: v for k, v in it.items() if k != "medium"})
+        return {
+            "items": items,
+            "total": sum(p["total"] for p in pages),
+            "page": page,
+            "more": any(p["more"] for p in pages),
+            "hidden": hidden,
+        }
 
     async def fetch(self, key: str, size: tuple[int, int], min_width: int = 1280) -> tuple[Artwork, Path]:
-        """Download one specific artwork (``met:123`` / ``cleveland:456``) chosen by hand."""
+        """Download one specific artwork (``met:123``, ``nga:46``…) chosen by hand."""
         source, _, ident = key.partition(":")
-        timeout = aiohttp.ClientTimeout(total=180)
-        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": USER_AGENT}) as session:
-            if source == "met":
-                art = await self._met_object(session, ident)
-            elif source == "cleveland":
-                data = await _json(session, f"{self.cma_api.rstrip('/')}/{ident}")
-                item = _cma_item(data.get("data") or {})
-                art = (
-                    Artwork(
-                        **{
-                            k: item[k]
-                            for k in ("source", "id", "title", "artist", "date", "url", "image_url")
-                        }
-                    )
-                    if item
-                    else None
-                )
-            else:
-                raise GalleryError(f"unknown artwork {key!r}")
+        if source not in self.sources or not ident:
+            raise GalleryError(f"unknown artwork {key!r}")
+        async with self._session(240) as session:
+            try:
+                art = await self.sources[source].by_id(session, ident)
+            except (aiohttp.ClientError, TimeoutError, ValueError, KeyError) as e:
+                raise GalleryError(f"{key}: {e or type(e).__name__}") from e
             if art is None:
                 raise GalleryError(f"{key} is not a public-domain work with an image")
             try:
-                data = await self._download(session, art.image_url)
-                jpeg = await asyncio.to_thread(_fit, data, min_width, size, 0)
+                jpeg = await self._image(session, art, min_width, size, 0)
             except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as e:
                 raise GalleryError(f"{key}: {e}") from e
         return art, self._store(art, jpeg)
@@ -198,20 +215,7 @@ class Gallery:
         path = self.dir / art["file"]
         return path if path.exists() else None
 
-    # -- sources -----------------------------------------------------------------
-
-    async def _candidate(self, session, source: str, query: str, tried: set[str]) -> Artwork | None:
-        if source == "met":
-            ids = await self._cached(("met", query), lambda: self._met_ids(session, query))
-            ids = [i for i in ids if f"met:{i}" not in tried]
-            if not ids:
-                return None
-            object_id = self.rng.choice(ids)
-            tried.add(f"met:{object_id}")
-            return await self._met_object(session, object_id)
-        arts = await self._cached(("cleveland", query), lambda: self._cma_artworks(session, query))
-        arts = [a for a in arts if a.key not in tried]
-        return self.rng.choice(arts) if arts else None
+    # -- helpers ---------------------------------------------------------------
 
     async def _cached(self, key, fetch):
         hit = self._cache.get(key)
@@ -220,40 +224,6 @@ class Gallery:
         items = await fetch()
         self._cache[key] = (time.monotonic(), items)
         return items
-
-    async def _met_ids(self, session, query: str) -> list[str]:
-        params = {"hasImages": "true", "medium": "Paintings", "q": query or "landscape"}
-        data = await _json(session, f"{self.met_api}/search?{urlencode(params)}")
-        return [str(i) for i in (data.get("objectIDs") or [])]
-
-    async def _met_object(self, session, object_id: str) -> Artwork | None:
-        o = await _json(session, f"{self.met_api}/objects/{object_id}")
-        if not o.get("isPublicDomain") or not o.get("primaryImage"):
-            return None
-        return Artwork(
-            source="met",
-            id=str(object_id),
-            title=(o.get("title") or "Untitled").strip(),
-            artist=(o.get("artistDisplayName") or "").strip(),
-            date=(o.get("objectDate") or "").strip(),
-            url=o.get("objectURL") or "",
-            image_url=o["primaryImage"],
-        )
-
-    async def _cma_artworks(self, session, query: str) -> list[Artwork]:
-        params = {"q": query or "landscape", "type": "Painting", "cc0": "1", "has_image": "1", "limit": "200"}
-        data = await _json(session, f"{self.cma_api}?{urlencode(params)}")
-        arts = []
-        for a in data.get("data") or []:
-            item = _cma_item(a)
-            if not item or item["landscape"] is False:
-                continue  # portrait or square: skip without downloading
-            arts.append(
-                Artwork(
-                    **{k: item[k] for k in ("source", "id", "title", "artist", "date", "url", "image_url")}
-                )
-            )
-        return arts
 
     async def _download(self, session, url: str) -> bytes:
         async with session.get(url) as resp:
@@ -281,16 +251,6 @@ class Gallery:
         return target
 
 
-async def _json(session, url: str) -> dict:
-    async with session.get(url, headers={"Accept": "application/json"}) as resp:
-        resp.raise_for_status()
-        text = await resp.text()
-    data = json.loads(text)
-    if not isinstance(data, dict):
-        raise ValueError("unexpected response")
-    return data
-
-
 def _fit(data: bytes, min_width: int, size: tuple[int, int], min_aspect: float = MIN_ASPECT) -> bytes:
     """Validate and crop to the output size. Raises ValueError for unsuitable images."""
     Image.MAX_IMAGE_PIXELS = 400_000_000  # museum scans are large but trusted sources
@@ -305,52 +265,6 @@ def _fit(data: bytes, min_width: int, size: tuple[int, int], min_aspect: float =
     out = io.BytesIO()
     fitted.save(out, "JPEG", quality=92)
     return out.getvalue()
-
-
-def _met_item(object_id, o: dict) -> dict | None:
-    if not o.get("isPublicDomain") or not o.get("primaryImage"):
-        return None
-    return {
-        "key": f"met:{object_id}",
-        "source": "met",
-        "id": str(object_id),
-        "title": (o.get("title") or "Untitled").strip(),
-        "artist": (o.get("artistDisplayName") or "").strip(),
-        "date": (o.get("objectDate") or "").strip(),
-        "url": o.get("objectURL") or "",
-        "image_url": o["primaryImage"],
-        "thumb": o.get("primaryImageSmall") or o["primaryImage"],
-        "width": None,
-        "height": None,
-        "landscape": None,
-    }
-
-
-def _cma_item(a: dict) -> dict | None:
-    images = a.get("images") or {}
-    img = images.get("print") or {}
-    if a.get("share_license_status") not in (None, "CC0") or not img.get("url"):
-        return None
-    try:
-        width, height = int(img.get("width") or 0), int(img.get("height") or 0)
-    except ValueError:
-        width = height = 0
-    creators = a.get("creators") or []
-    artist = (creators[0].get("description") or "").split("(")[0].strip() if creators else ""
-    return {
-        "key": f"cleveland:{a.get('id')}",
-        "source": "cleveland",
-        "id": str(a.get("id")),
-        "title": (a.get("title") or "Untitled").strip(),
-        "artist": artist,
-        "date": (a.get("creation_date") or "").strip(),
-        "url": a.get("url") or "",
-        "image_url": img["url"],
-        "thumb": (images.get("web") or {}).get("url") or img["url"],
-        "width": width or None,
-        "height": height or None,
-        "landscape": (width >= height * MIN_ASPECT) if width and height else None,
-    }
 
 
 ITEM_FIELDS = ("key", "source", "id", "title", "artist", "date", "url", "thumb")

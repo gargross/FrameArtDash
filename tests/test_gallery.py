@@ -139,7 +139,7 @@ class FakeGallery(Gallery):
         super().__init__(directory)
         self.picks = 0
 
-    async def pick(self, query, sources, recent, min_width, size):
+    async def pick(self, query, sources, recent, min_width, size, exclude=()):
         self.picks += 1
         art = Artwork("met", str(self.picks), f"Painting {self.picks}", "Artist", "1870")
         return art, self._store(art, _jpeg(64, 36))
@@ -334,3 +334,211 @@ async def test_schedule_collection_rotation_show_and_hold(tmp_path):
     svc.set_hold(False)
     await svc.gallery_next()
     assert svc.gallery.picks == 1  # 12:01 is outside the rule: museum search
+
+
+# -- new museums, subject filter, alternatives ---------------------------------
+
+NGA_OBJECTS = (
+    "objectid,title,displaydate,attribution,medium,classification\n"
+    "46,Country House in a Park,c. 1675,Jacob van Ruisdael,oil on canvas,Painting\n"
+    "47,The Adoration of the Magi,1480,Botticelli,tempera on panel,Painting\n"
+    "48,Two Jugs,1850,Unknown,stoneware,Decorative Art\n"
+    "49,Tall Lady,1880,Someone,oil on canvas,Painting\n"
+)
+
+
+def _new_museums_app():
+    images = {"aic-big.jpg": _jpeg(3840, 2200), "nga.jpg": _jpeg(3840, 2400), "rijks.jpg": _jpeg(4000, 2500)}
+    calls = []
+
+    async def aic_search(request):
+        calls.append(("aic", dict(request.query)))
+        return web.json_response(
+            {
+                "pagination": {"total": 3},
+                "data": [
+                    {
+                        "id": 1,
+                        "title": "Water Lilies",
+                        "artist_title": "Claude Monet",
+                        "date_display": "1906",
+                        "image_id": "img1",
+                        "is_public_domain": True,
+                        "artwork_type_title": "Painting",
+                        "thumbnail": {"width": 4000, "height": 2400},
+                        "subject_titles": ["water", "flowers"],
+                    },
+                    {
+                        "id": 2,
+                        "title": "Evening Scene",
+                        "artist_title": "X",
+                        "image_id": "img2",
+                        "is_public_domain": True,
+                        "artwork_type_title": "Painting",
+                        "thumbnail": {"width": 4000, "height": 2400},
+                        "subject_titles": ["Saints", "Christianity"],
+                    },
+                    {
+                        "id": 3,
+                        "title": "A Print",
+                        "image_id": "img3",
+                        "is_public_domain": True,
+                        "artwork_type_title": "Print",
+                    },
+                ],
+            }
+        )
+
+    async def aic_iiif(request):
+        size = request.match_info["size"]
+        calls.append(("aic-img", size))
+        if size == "3840,":
+            return web.Response(status=403)  # the server refuses very large sizes
+        return web.Response(body=images["aic-big.jpg"], content_type="image/jpeg")
+
+    async def nga_csv(request):
+        name = request.match_info["name"]
+        calls.append(("nga", name))
+        base = str(request.url.origin())
+        if name == "objects.csv":
+            return web.Response(text=NGA_OBJECTS)
+        rows = [
+            "uuid,iiifurl,iiifthumburl,viewtype,width,height,openaccess,depictstmsobjectid",
+            f"u1,{base}/nga-iiif/u1,{base}/nga-iiif/u1/thumb,primary,7741,6036,1,46",
+            f"u2,{base}/nga-iiif/u2,,primary,5000,3000,1,47",
+            f"u3,{base}/nga-iiif/u3,,primary,5000,3000,1,48",
+            f"u4,{base}/nga-iiif/u4,,primary,5000,3000,0,49",
+        ]
+        return web.Response(text="\n".join(rows) + "\n")
+
+    async def nga_iiif(request):
+        return web.Response(body=images["nga.jpg"], content_type="image/jpeg")
+
+    async def rijks_search(request):
+        calls.append(("rijks", dict(request.query)))
+        return web.json_response(
+            {
+                "partOf": {"totalItems": 1},
+                "orderedItems": [{"id": "https://id.rijksmuseum.nl/200100988", "type": "HumanMadeObject"}],
+            }
+        )
+
+    async def rijks_record(request):
+        ident = request.match_info["ident"]
+        records = {
+            "200100988": {
+                "identified_by": [
+                    {
+                        "type": "Name",
+                        "content": "De Molen",
+                        "language": [{"id": "http://vocab.getty.edu/aat/300388256"}],
+                    },
+                    {
+                        "type": "Name",
+                        "content": "The Mill",
+                        "language": [{"id": "http://vocab.getty.edu/aat/300388277"}],
+                    },
+                ],
+                "produced_by": {
+                    "part": [{"carried_out_by": [{"_label": "Jacob van Ruisdael"}]}],
+                    "timespan": {"identified_by": [{"content": "c. 1670"}], "end_of_the_end": "1670-12-31"},
+                },
+                "shows": [{"id": "https://id.rijksmuseum.nl/202100988", "type": "VisualItem"}],
+            },
+            "202100988": {
+                "digitally_shown_by": [{"id": "https://id.rijksmuseum.nl/500900", "type": "DigitalObject"}]
+            },
+            "500900": {"access_point": [{"id": "https://iiif.micr.io/ABCDE/full/max/0/default.jpg"}]},
+        }
+        return web.json_response(records[ident])
+
+    app = web.Application()
+    app.router.add_get("/aic/artworks/search", aic_search)
+    app.router.add_get("/aic-iiif/{image}/full/{size}/0/default.jpg", aic_iiif)
+    app.router.add_get("/nga/{name}", nga_csv)
+    app.router.add_get("/nga-iiif/{rest:.*}", nga_iiif)
+    app.router.add_get("/rijks/search/collection", rijks_search)
+    app.router.add_get("/rijks/{ident}", rijks_record)
+    return app, calls
+
+
+async def _new_gallery(tmp_path):
+    app, calls = _new_museums_app()
+    server = TestServer(app)
+    await server.start_server()
+    base = str(server.make_url(""))
+    g = Gallery(
+        tmp_path / "gallery",
+        aic_api=base + "/aic",
+        aic_iiif=base + "/aic-iiif",
+        nga_data=base + "/nga",
+        rijks_api=base + "/rijks",
+        rng=random.Random(3),
+    )
+    return g, server, calls
+
+
+async def test_aic_public_domain_paintings_with_size_fallback_and_exclusion(tmp_path):
+    from frameartdash.config import DEFAULT_EXCLUDE
+
+    exclude = tuple(w.strip() for w in DEFAULT_EXCLUDE.split(","))
+    g, server, calls = await _new_gallery(tmp_path)
+    try:
+        page = await g.search("aic", "water", 0, exclude=exclude)
+        assert [i["key"] for i in page["items"]] == ["aic:1"] and page[
+            "hidden"
+        ] == 1  # 'Saints' tag hidden, print dropped
+        art, path = await g.pick("water", ("aic",), [], 3000, (384, 216), exclude)
+        assert art.key == "aic:1" and art.artist == "Claude Monet"
+        assert ("aic-img", "3840,") in calls and ("aic-img", "2400,") in calls  # refused, then the next size
+    finally:
+        await server.close()
+
+
+async def test_nga_index_open_access_paintings_and_word_match(tmp_path):
+    g, server, calls = await _new_gallery(tmp_path)
+    try:
+        page = await g.search("nga", "oil, tempera, stoneware", 0)
+        assert sorted(i["key"] for i in page["items"]) == ["nga:46", "nga:47"]  # painting + open access only
+        assert (await g.search("nga", "ruisdael park", 0))["items"][0]["title"] == "Country House in a Park"
+        assert (await g.search("nga", "ruisdael magi", 0))["items"] == []  # all words must match
+        art, path = await g.pick("park, magi", ("nga",), [], 3000, (384, 216), ("Adoration",))
+        assert art.key == "nga:46" and path.exists()
+        assert sum(1 for c in calls if c == ("nga", "objects.csv")) == 1  # cached index
+        assert (tmp_path / "gallery" / "nga-index.json").exists()
+    finally:
+        await server.close()
+
+
+async def test_rijks_linked_art_chain(tmp_path):
+    g, server, calls = await _new_gallery(tmp_path)
+    try:
+        page = await g.search("rijks", "molen", 0)
+        it = page["items"][0]
+        assert it["title"] == "The Mill" and it["artist"] == "Jacob van Ruisdael" and it["date"] == "c. 1670"
+        assert it["thumb"] == "https://iiif.micr.io/ABCDE/full/400,/0/default.jpg"
+        assert calls[0] == ("rijks", {"type": "painting", "imageAvailable": "true", "title": "molen"})
+    finally:
+        await server.close()
+
+
+def test_split_terms_and_excluded():
+    from frameartdash.gallery import excluded, split_terms
+
+    assert split_terms(" seascape, winter harbor ,, ") == ["seascape", "winter harbor"]
+    words = ("Saint", "Angel", "Last Supper")
+    assert excluded("Saints in a Landscape", [], words) == "Saint"
+    assert excluded("View of Michelangelo's Garden", [], words) is None  # word prefix, not substring
+    assert excluded("The Last Supper", [], words) == "Last Supper"
+    assert excluded("Harbor", ["Angels"], words) == "Angel"
+    assert excluded("Harbor", [], ()) is None
+
+
+async def test_search_merges_comma_alternatives(tmp_path):
+    g, server, seen = await _gallery(tmp_path)
+    try:
+        res = await g.search("cleveland", "fields, harbour", 0)
+        assert sorted(q["q"] for q in seen) == ["fields", "harbour"]
+        assert [i["key"] for i in res["items"]] == ["cleveland:10", "cleveland:11"]  # de-duplicated
+    finally:
+        await server.close()

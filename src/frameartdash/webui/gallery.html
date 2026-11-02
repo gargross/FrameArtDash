@@ -128,11 +128,11 @@
   <section>
     <h2>Find art</h2>
     <form class="searchbar" id="searchForm">
-      <input type="text" id="q" placeholder="Search paintings — e.g. landscape, nocturne, Monet, winter, sea" autocomplete="off">
-      <select id="source"><option value="met">The Met</option><option value="cleveland">Cleveland Museum of Art</option></select>
+      <input type="text" id="q" placeholder="Search paintings — e.g. seascape, harbor, Monet (commas = any of these)" autocomplete="off">
+      <select id="source"><option value="met">The Met</option><option value="cleveland">Cleveland Museum of Art</option><option value="aic">Art Institute of Chicago</option><option value="nga">National Gallery of Art</option><option value="rijks">Rijksmuseum</option></select>
       <button class="btn primary" type="submit">Search</button>
     </form>
-    <div class="note" id="searchNote">Public-domain paintings only. Wide, large works fill the Frame best.</div>
+    <div class="note" id="searchNote">Public-domain paintings only. Commas separate alternatives. Wide, large works fill the Frame best. The National Gallery's first search downloads its open-data index and can take a minute.</div>
     <div class="grid" id="results" style="margin-top:14px"></div>
     <div class="more hidden" id="moreWrap"><button class="btn" id="moreBtn">Load more</button></div>
   </section>
@@ -157,7 +157,7 @@
 
 <script>
 const DAYS = ["mon","tue","wed","thu","fri","sat","sun"];
-const SOURCES = {met: "The Met", cleveland: "Cleveland Museum of Art"};
+let SOURCES = {met: "The Met", cleveland: "Cleveland Museum of Art", aic: "Art Institute of Chicago", nga: "National Gallery of Art", rijks: "Rijksmuseum"};
 let overview = null, page = 0, lastQuery = null;
 
 const $ = (id) => document.getElementById(id);
@@ -187,6 +187,7 @@ async function busy(btn, label, fn) {
 // -- overview --------------------------------------------------------------
 async function load() {
   overview = await api("/api/gallery");
+  if (overview.source_labels) SOURCES = overview.source_labels;
   $("offBanner").classList.toggle("hidden", overview.enabled);
   const c = overview.current;
   $("mat").innerHTML = c ? `<img src="/api/gallery/current.jpg?k=${encodeURIComponent(c.key || c.id)}${encodeURIComponent(c.chosen_at || "")}" alt="">` : `<span class="note">No painting yet</span>`;
@@ -277,7 +278,8 @@ async function search(more) {
     res.items.forEach((i) => $("results").appendChild(artCard(i, "search")));
     refreshStars();
     $("moreWrap").classList.toggle("hidden", !res.more);
-    $("searchNote").textContent = res.total ? `${res.total.toLocaleString()} matches at ${SOURCES[lastQuery.source]} — public-domain paintings shown` : "No matches";
+    const hiddenNote = res.hidden ? ` · ${res.hidden} hidden by "Leave out subjects"` : "";
+    $("searchNote").textContent = res.total ? `${res.total.toLocaleString()} matches at ${SOURCES[lastQuery.source]} — public-domain paintings shown${hiddenNote}` : "No matches";
   } catch (e) { $("searchNote").textContent = ""; toast(e.message, true); }
 }
 
