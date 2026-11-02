@@ -38,6 +38,13 @@ class Field:
 
 
 GROUPS = ("Source", "TV", "Look", "Gallery", "Schedule")
+GALLERY_SOURCE_NAMES = ("met", "cleveland", "aic", "nga", "rijks")
+DEFAULT_EXCLUDE = (
+    "Christ, Jesus, Madonna, Virgin, Saint, Holy, Annunciation, Crucifixion, Nativity, Adoration, Angel, "
+    "Apostle, Bible, Biblical, Pietà, Pieta, Resurrection, Baptism, Magi, Lamentation, Deposition, Entombment, "
+    "Ascension, Assumption, Martyrdom, Prophet, Moses, Last Supper, Pentecost, Trinity, Evangelist, Calvary, "
+    "Golgotha, Flight into Egypt, Holy Family, Mary Magdalene, God the Father"
+)
 
 FIELDS: tuple[Field, ...] = (
     # Source
@@ -211,9 +218,19 @@ FIELDS: tuple[Field, ...] = (
         "GALLERY_SOURCES",
         "Museums",
         "Gallery",
-        "met,cleveland",
-        help="Comma-separated: met (The Met), cleveland (Cleveland Museum of Art).",
-        advanced=True,
+        "met,cleveland,aic,nga,rijks",
+        help="Comma-separated: met (The Met), cleveland (Cleveland Museum of Art), aic (Art Institute of "
+        "Chicago), nga (National Gallery of Art), rijks (Rijksmuseum). Only open-access collections can be used.",
+        only="cards",
+    ),
+    Field(
+        "GALLERY_EXCLUDE",
+        "Leave out subjects",
+        "Gallery",
+        DEFAULT_EXCLUDE,
+        kind="textarea",
+        help="Comma-separated words; paintings whose title (or museum subject tags) contain one are skipped. "
+        "Matches word beginnings: 'Saint' also skips 'Saints'. Empty = no filter.",
         only="cards",
     ),
     Field(
@@ -392,7 +409,8 @@ class Settings:
     gallery: bool = False
     gallery_query: str = "landscape"
     gallery_interval_min: int = 60
-    gallery_sources: tuple[str, ...] = ("met", "cleveland")
+    gallery_sources: tuple[str, ...] = GALLERY_SOURCE_NAMES
+    gallery_exclude: tuple[str, ...] = ()
     gallery_min_width: int = 3000
     gallery_caption: bool = True
     cards_on_demand: bool = False
@@ -511,16 +529,17 @@ class Settings:
         if quality > 100:
             raise ConfigError(f"JPEG_QUALITY must be <= 100, got {quality}")
 
-        gallery_sources = tuple(
-            x.strip().lower()
-            for x in (_str(env, "GALLERY_SOURCES") or "met,cleveland").split(",")
-            if x.strip()
-        )
-        unknown = [x for x in gallery_sources if x not in ("met", "cleveland")]
+        raw_sources = _str(env, "GALLERY_SOURCES") or ",".join(GALLERY_SOURCE_NAMES)
+        gallery_sources = tuple(x.strip().lower() for x in raw_sources.split(",") if x.strip())
+        unknown = [x for x in gallery_sources if x not in GALLERY_SOURCE_NAMES]
         if unknown or not gallery_sources:
             raise ConfigError(
-                f"GALLERY_SOURCES: expected met and/or cleveland, got {', '.join(unknown) or 'nothing'}"
+                f"GALLERY_SOURCES: choose from {', '.join(GALLERY_SOURCE_NAMES)}; "
+                f"{', '.join(unknown) or 'nothing'} is not available (only open-access collections can be used)"
             )
+        gallery_exclude = tuple(
+            w.strip() for w in _str(env, "GALLERY_EXCLUDE").replace("\n", ",").split(",") if w.strip()
+        )
 
         time_zone = _str(env, "TIME_ZONE")
         if time_zone:
@@ -568,6 +587,7 @@ class Settings:
             gallery_query=_str(env, "GALLERY_QUERY") or "landscape",
             gallery_interval_min=_int(env, "GALLERY_INTERVAL_MIN", minimum=5),
             gallery_sources=gallery_sources,
+            gallery_exclude=gallery_exclude,
             gallery_min_width=_int(env, "GALLERY_MIN_WIDTH", minimum=640),
             gallery_caption=_bool(env, "GALLERY_CAPTION", True),
             cards_on_demand=_bool(env, "CARDS_ON_DEMAND"),

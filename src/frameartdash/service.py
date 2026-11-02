@@ -326,7 +326,12 @@ class Service:
             else:
                 query = (rule or {}).get("query") or s.gallery_query
                 art, path = await self.gallery.pick(
-                    query, s.gallery_sources, state.gallery_recent, s.gallery_min_width, s.output_size
+                    query,
+                    s.gallery_sources,
+                    state.gallery_recent,
+                    s.gallery_min_width,
+                    s.output_size,
+                    s.gallery_exclude,
                 )
         except (GalleryError, OSError) as e:
             log.warning("Gallery: keeping the current picture, no new artwork (%s)", e)
