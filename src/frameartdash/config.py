@@ -30,7 +30,7 @@ class Field:
     label: str
     group: str
     default: str = ""
-    kind: str = "text"  # text | url | secret | number | bool | select | textarea | background
+    kind: str = "text"  # text | url | secret | number | bool | select | multi | textarea | background
     help: str = ""
     options: tuple[str, ...] = ()
     advanced: bool = False
@@ -219,8 +219,15 @@ FIELDS: tuple[Field, ...] = (
         "Museums",
         "Gallery",
         "met,cleveland,aic,nga,rijks",
-        help="Comma-separated: met (The Met), cleveland (Cleveland Museum of Art), aic (Art Institute of "
-        "Chicago), nga (National Gallery of Art), rijks (Rijksmuseum). Only open-access collections can be used.",
+        kind="multi",
+        options=(
+            "met|The Met",
+            "cleveland|Cleveland Museum of Art",
+            "aic|Art Institute of Chicago",
+            "nga|National Gallery of Art",
+            "rijks|Rijksmuseum",
+        ),
+        help="Open-access collections the hourly painting comes from. Pick at least one.",
         only="cards",
     ),
     Field(

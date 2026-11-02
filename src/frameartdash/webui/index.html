@@ -396,6 +396,14 @@ function fieldHtml(f, value, secretSet) {
     const on = String(value).toLowerCase() === "true";
     return `<div class="${cls}"><label class="switch"><input type="checkbox" id="${id}" data-key="${f.key}" ${on ? "checked" : ""}> ${esc(f.label)}</label>${help}</div>`;
   }
+  if (f.kind === "multi") {
+    const chosen = String(value || "").split(",").map((v) => v.trim()).filter(Boolean);
+    const boxes = f.options.map((o) => {
+      const [val, label] = o.split("|");
+      return `<label class="switch"><input type="checkbox" value="${esc(val)}" ${chosen.includes(val) ? "checked" : ""}> ${esc(label || val)}</label>`;
+    }).join("");
+    return `<div class="${cls}"><label>${esc(f.label)}</label><div class="multi" data-key="${f.key}" style="display:grid;gap:8px;margin:6px 0">${boxes}</div>${help}</div>`;
+  }
   if (f.kind === "select") {
     input = `<select id="${id}" data-key="${f.key}">${f.options.map((o) =>
       `<option value="${esc(o)}" ${o === value ? "selected" : ""}>${o === "" ? "Default" : esc(o)}</option>`).join("")}</select>`;
@@ -501,9 +509,13 @@ $("advToggle").onchange = (e) => $("panels").classList.toggle("show-adv", e.targ
 
 $("settingsForm").onsubmit = async (e) => {
   e.preventDefault();
+  const emptyMulti = [...$("panels").querySelectorAll(".multi")].find((m) => !m.querySelector("input:checked"));
+  if (emptyMulti) { alert("Pick at least one museum."); return; }
   const values = {};
   $("panels").querySelectorAll("[data-key]").forEach((el) => {
-    values[el.dataset.key] = el.type === "checkbox" ? String(el.checked) : el.value;
+    values[el.dataset.key] = el.classList.contains("multi")
+      ? [...el.querySelectorAll("input:checked")].map((i) => i.value).join(",")
+      : el.type === "checkbox" ? String(el.checked) : el.value;
   });
   values.BG_IMAGE = selectedBg;
   const msg = $("saveMsg");
