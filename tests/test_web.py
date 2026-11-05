@@ -166,3 +166,111 @@ async def test_card_editor_endpoints(client):
     assert canvas.status == 200 and "Home Assistant" in await canvas.text()
     assert (await client.get("/static/mdi.json")).status == 200
     assert (await client.get("/static/../settings.json")).status == 404
+
+
+class _ArtFrame:
+    """Fake Frame for POST /artmode: reaches Art Mode after `confirm_after` checks."""
+
+    def __init__(self, power="tv", confirm_after=1):
+        self.power = power
+        self.confirm_after = confirm_after
+        self.set_calls: list[bool] = []
+        self.checks = 0
+
+    async def power_state(self):
+        return self.power
+
+    async def set_art_mode(self, on=True):
+        self.set_calls.append(on)
+
+    async def art_mode(self):
+        self.checks += 1
+        return self.confirm_after is not None and self.checks >= self.confirm_after
+
+
+def _fake_connect(monkeypatch, fake):
+    from contextlib import asynccontextmanager
+
+    from frameartdash import web as web_mod
+
+    @asynccontextmanager
+    async def connect(settings):
+        if isinstance(fake, Exception):
+            raise fake
+        yield fake
+
+    monkeypatch.setattr(web_mod.frame_mod, "connect", connect)
+    monkeypatch.setattr(web_mod, "ARTMODE_POLL_S", 0.01)
+    monkeypatch.setattr(web_mod, "ARTMODE_WAIT_S", 0.2)
+    pushed = []
+    monkeypatch.setattr(web_mod, "_push_soon", lambda service: pushed.append(service))
+    return pushed
+
+
+@pytest.fixture
+async def tv_client(client):
+    await login(client)
+    resp = await client.put("/api/settings", json={"values": {"FRAME_HOST": "10.0.0.5"}})
+    assert resp.status == 200, await resp.text()
+    client.key = {"Authorization": f"Bearer {client.auth.api_key}"}
+    return client
+
+
+async def test_artmode_needs_api_key(client):
+    assert (await client.post("/artmode")).status == 401
+
+
+async def test_artmode_switches_from_an_app(tv_client, monkeypatch):
+    fake = _ArtFrame(power="tv", confirm_after=3)
+    pushed = _fake_connect(monkeypatch, fake)
+    resp = await tv_client.post("/artmode", headers=tv_client.key)
+    body = await resp.json()
+    assert resp.status == 200, body
+    assert body == {"status": "art", "power_before": "tv", "changed": True}
+    assert fake.set_calls == [True] and fake.checks == 3
+    assert len(pushed) == 1
+
+
+async def test_artmode_unknown_on_state_still_switches(tv_client, monkeypatch):
+    fake = _ArtFrame(power="on")
+    _fake_connect(monkeypatch, fake)
+    resp = await tv_client.post("/artmode", headers=tv_client.key)
+    assert resp.status == 200 and fake.set_calls == [True]
+
+
+async def test_artmode_already_art_is_a_no_op(tv_client, monkeypatch):
+    fake = _ArtFrame(power="art")
+    pushed = _fake_connect(monkeypatch, fake)
+    resp = await tv_client.post("/artmode", headers=tv_client.key)
+    assert resp.status == 200 and (await resp.json())["changed"] is False
+    assert fake.set_calls == [] and pushed == []
+
+
+@pytest.mark.parametrize("power", ["off", "standby"])
+async def test_artmode_refuses_when_tv_is_off(tv_client, monkeypatch, power):
+    fake = _ArtFrame(power=power)
+    _fake_connect(monkeypatch, fake)
+    resp = await tv_client.post("/artmode", headers=tv_client.key)
+    assert resp.status == 409 and (await resp.json())["status"] == "tv_off"
+    assert fake.set_calls == []
+
+
+async def test_artmode_not_confirmed(tv_client, monkeypatch):
+    fake = _ArtFrame(power="tv", confirm_after=None)
+    pushed = _fake_connect(monkeypatch, fake)
+    resp = await tv_client.post("/artmode", headers=tv_client.key)
+    assert resp.status == 504 and (await resp.json())["status"] == "not_confirmed"
+    assert pushed == []
+
+
+async def test_artmode_unreachable(tv_client, monkeypatch):
+    from frameartdash.frame import FrameUnreachable
+
+    _fake_connect(monkeypatch, FrameUnreachable("10.0.0.5 not reachable"))
+    resp = await tv_client.post("/artmode", headers=tv_client.key)
+    assert resp.status == 503 and (await resp.json())["status"] == "unreachable"
+
+
+async def test_artmode_without_tv_configured(client):
+    resp = await client.post("/artmode", headers={"Authorization": f"Bearer {client.auth.api_key}"})
+    assert resp.status == 400
