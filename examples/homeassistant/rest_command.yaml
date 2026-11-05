@@ -11,7 +11,7 @@ rest_command:
   frameartdash_artmode:
     url: http://192.168.1.20:8080/artmode
     method: POST
-    timeout: 40   # the call waits for the TV to confirm Art Mode (up to ~35 s)
+    timeout: 120  # renders and uploads a fresh picture, then waits for the TV to confirm Art Mode
     headers:
       Authorization: "Bearer <api key>"
 

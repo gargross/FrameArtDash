@@ -491,10 +491,13 @@ ARTMODE_POLL_S = 1.0
 
 
 async def artmode(request: web.Request) -> web.Response:
-    """``POST /artmode``: switch a TV that is on (e.g. in an app) to Art Mode, then push a picture.
+    """``POST /artmode``: switch a TV that is on (e.g. in an app) to Art Mode with a fresh picture.
 
-    Answers once the TV confirms: ``200`` with ``changed`` false if it already was in Art Mode,
-    ``409`` if the TV is off or in standby (wake it first), ``503`` if it is unreachable,
+    If the TV is not in Art Mode yet, a forced cycle runs first (the upload is selected without
+    being shown, so the app is not interrupted), then Art Mode is switched on, confirmed, and the
+    new picture put on screen, so last night's picture is never what appears.
+    Answers ``200`` once in Art Mode (``changed`` false if it already was; ``cycle`` is the cycle's
+    status), ``409`` if the TV is off or in standby (wake it first), ``503`` if it is unreachable,
     ``504`` if it did not confirm Art Mode in time. Never turns Art Mode off.
     """
     if not _api_key_ok(request):
@@ -504,14 +507,20 @@ async def artmode(request: web.Request) -> web.Response:
     if not settings.frame_host:
         return _json_error("no TV IP address configured")
     try:
-        async with asyncio.timeout(ARTMODE_WAIT_S + 20):
+        async with asyncio.timeout(25):
             async with frame_mod.connect(settings) as frame:
                 power = await frame.power_state()
-                if power in ("off", "standby"):
-                    return web.json_response({"status": "tv_off", "power": power}, status=409)
-                if power == "art":
-                    return web.json_response({"status": "art", "power_before": power, "changed": False})
-                log.info("Switching the TV to Art Mode (power state %s)", power)
+        if power in ("off", "standby"):
+            return web.json_response({"status": "tv_off", "power": power}, status=409)
+        if power == "art":
+            return web.json_response({"status": "art", "power_before": power, "changed": False})
+
+        # Fresh picture first; a failed cycle must not keep the TV out of Art Mode.
+        cycle = await service.run_cycle(force=True)
+        log.info("Switching the TV to Art Mode (power state %s, cycle %s)", power, cycle.status)
+
+        async with asyncio.timeout(ARTMODE_WAIT_S + 20):
+            async with frame_mod.connect(settings) as frame:
                 await frame.set_art_mode(True)
                 loop = asyncio.get_running_loop()
                 deadline = loop.time() + ARTMODE_WAIT_S
@@ -523,9 +532,17 @@ async def artmode(request: web.Request) -> web.Response:
                         log.debug("Art Mode check failed, retrying: %s", e)
                     if loop.time() >= deadline:
                         return web.json_response(
-                            {"status": "not_confirmed", "power_before": power}, status=504
+                            {"status": "not_confirmed", "power_before": power, "cycle": cycle.status},
+                            status=504,
                         )
                     await asyncio.sleep(ARTMODE_POLL_S)
+                # Some Frames keep showing the previous picture until the current one is shown again.
+                current = service.store.load().current_id
+                if current:
+                    try:
+                        await frame.select(current, show=True)
+                    except Exception as e:  # noqa: BLE001 - Art Mode is on; the picture is a bonus
+                        log.warning("Showing %s after the Art Mode switch failed: %s", current, e)
     except frame_mod.FrameUnreachable as e:
         return web.json_response({"status": "unreachable", "error": str(e)}, status=503)
     except TimeoutError:
@@ -533,8 +550,7 @@ async def artmode(request: web.Request) -> web.Response:
     except Exception as e:  # noqa: BLE001 - reported to the caller
         log.warning("Art Mode switch failed: %s", e)
         return _json_error(str(e) or type(e).__name__, 502)
-    _push_soon(service)
-    return web.json_response({"status": "art", "power_before": power, "changed": True})
+    return web.json_response({"status": "art", "power_before": power, "changed": True, "cycle": cycle.status})
 
 
 # -- gallery (web UI, session auth) -------------------------------------------
